@@ -20,9 +20,11 @@ laptop / agent ──nuhpc──► ssh+rsync ──► login.explorer.northeast
 ## Install
 
 ```bash
-uv tool install ./nuhpc        # or: pipx install ./nuhpc
+uv tool install git+https://github.com/lordgrilo/nuhpc    # or, from a clone: uv tool install --editable .
 nuhpc init                     # writes ~/.config/nuhpc/config.toml
 ```
+
+`uv` fetches a Python ≥3.11 if your system one is older. With `--editable`, edits to the clone take effect immediately; otherwise upgrade with `uv tool upgrade nuhpc`. Tests run offline: `uv run --no-project --with pytest --with-editable . pytest`.
 
 Edit the config: set `remote_root`, `env_setup`, and the profiles. Every line marked `VERIFY` is an assumption about Explorer that you should check.
 
@@ -145,8 +147,13 @@ Things to add when you get there:
 
 ### Mode 1: agent outside, cluster runs plain batch (recommended)
 
-1. Copy `skill/nuhpc/` to `~/.claude/skills/nuhpc/`. It tells Claude Code how to use the CLI and what it must not do.
-2. Restrict the tools, either in the project's `.claude/settings.json` or with flags:
+1. Link `skill/nuhpc/` into both agents' user skill folders. It tells the agent how to use the CLI and what it must not do. Claude Code reads `~/.claude/skills/`; Codex (the ChatGPT-account agent) reads `~/.agents/skills/`. One copy serves both, so updating the repo updates both:
+   ```bash
+   mkdir -p ~/.agents/skills ~/.claude/skills
+   ln -s "$PWD/skill/nuhpc" ~/.agents/skills/nuhpc
+   ln -s ~/.agents/skills/nuhpc ~/.claude/skills/nuhpc
+   ```
+2. Restrict the tools. For Codex: its default sandbox has no network, so it asks before running `nuhpc` outside the sandbox. Answering "always" records `prefix_rule(pattern=["nuhpc"], decision="allow")` in `~/.codex/rules/default.rules`. For Claude Code, use the project's `.claude/settings.json` or flags:
    ```json
    { "permissions": {
        "allow": ["Bash(nuhpc:*)"],
@@ -157,7 +164,7 @@ Things to add when you get there:
    ```bash
    echo 'cd ~/proj && claude -p "Execute the plan in PLAN.md with nuhpc. Poll status every 10 min until all runs finish, fetch results, write REPORT.md." --allowedTools "Bash(nuhpc:*)" Read Write Edit' | at 02:00
    ```
-   The SSH ControlMaster session must still be alive at that time. If Duo is required and the session has expired, the run fails immediately and cleanly; it does not hang.
+   With Codex, `codex exec "..."` plays the same role. The SSH ControlMaster session must still be alive at that time. If Duo is required and the session has expired, the run fails immediately and cleanly; it does not hang.
 
 ### Mode 2: agent on the cluster
 
