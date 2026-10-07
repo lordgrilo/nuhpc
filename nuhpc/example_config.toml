@@ -10,10 +10,10 @@ default_profile = "gpu1"
 
 # Pasted verbatim at the top of every job, after Slurm directives.
 env_setup = """
-module load cuda/12.1                          # VERIFY: `module avail cuda`
-source /projects/YOUR_GROUP/envs/llm/bin/activate
-export HF_HOME=/scratch/YOUR_USER/hf_cache     # keep model weights off $HOME (small quota)
-export HF_HUB_OFFLINE=1                        # GPU jobs read cached weights only
+source /projects/YOUR_GROUP/envs/llm/bin/activate   # a uv venv built inside a job: README "Python environment"
+# module load cuda/12.8.0                      # modules: 12.1.1, 12.3.0, 12.8.0, 13.2.0. pip torch bundles CUDA
+export HF_HOME=/projects/YOUR_GROUP/hf_cache   # keep model weights off $HOME; /scratch/$USER if it is writable
+export HF_HUB_OFFLINE=1                        # cached weights only (compute nodes do have internet; this is for reproducibility)
 export TOKENIZERS_PARALLELISM=false
 """
 
@@ -23,7 +23,8 @@ max_tasks = 200
 default_max_parallel = 8         # array throttle unless --max-parallel given
 fetch_max_file_size = "1G"       # fetch skips bigger files (checkpoints) unless --max-size
 
-# Profiles. Partition names, time limits and GPU types: VERIFY with `nuhpc check`.
+# Profiles. Seen with `nuhpc check` on 2026-10-07: gpu (8h max; a100, h200, t4, v100 types),
+# gpu-short / gpu-interactive (2h), short (CPU, default, 2 days). Re-check: access varies by account.
 [profiles.cpu]
 partition = "short"
 cpus = 8
@@ -51,8 +52,8 @@ mem = "200G"
 time = "08:00:00"
 gres = "gpu:h200:1"
 
-[profiles.multigpu]              # 4 GPUs on one node, for 70B-class TP or DDP. May need RC approval. VERIFY
-partition = "multigpu"
+[profiles.multigpu]              # 4 GPUs on one node, for 70B-class TP or DDP. The multigpu partition is
+partition = "multigpu"           # invisible until RC grants access; without it try partition "gpu" (8h). VERIFY
 cpus = 32
 mem = "400G"
 time = "24:00:00"

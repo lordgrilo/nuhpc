@@ -47,6 +47,25 @@ Then install your key on the cluster with `ssh-copy-id explorer`, which RC docum
 
 All of nuhpc's own connections use `BatchMode=yes`. An expired session therefore fails immediately with a hint, rather than hanging an agent at a password prompt.
 
+### Python environment
+
+Jobs activate whatever `env_setup` names, so build that environment once, **inside a job**. Explorer kills conda on login nodes (even `conda --version`). Project storage costs about 0.1 s per file written, so a serial `conda`/`pip` install of vLLM plus torch runs for hours. `uv` installs in parallel and finished in 19 minutes. Compute nodes have outbound internet. The shared Anaconda Python has pip; the system `python3` does not.
+
+```bash
+# in an sbatch script (-p short -c 8 --mem=32G -t 06:00:00), or under `srun ... --pty bash`
+export UV_CACHE_DIR=/tmp/$USER-uv UV_LINK_MODE=copy
+export UV_PYTHON_INSTALL_DIR=/projects/YOUR_GROUP/envs/.python   # the venv's interpreter must exist on every node
+/shared/EL9/explorer/anaconda3/2024.06/bin/python3 -m pip install --target /tmp/$USER-uvbin uv
+/tmp/$USER-uvbin/bin/uv venv --python 3.12 /projects/YOUR_GROUP/envs/llm
+/tmp/$USER-uvbin/bin/uv pip install --python /projects/YOUR_GROUP/envs/llm/bin/python --torch-backend=cu129 \
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.31.0/vllm-0.31.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl" \
+  huggingface_hub openai
+```
+
+**Match CUDA to the driver.** A plain `pip install vllm` gets CUDA 13.0 wheels. Explorer's GPU driver (570.86 on 2026-10-07, CUDA ≤12.8) is too old for them: torch still reports `cuda available: True`, but the first kernel fails with "driver too old". CUDA 12.9 builds run on it, because NVIDIA keeps runtimes compatible within 12.x. Check `nvidia-smi` in the smoke log after any driver or version change; the smoke template launches a real kernel for this reason.
+
+`env_setup` then needs only `source /projects/YOUR_GROUP/envs/llm/bin/activate`. Put the environment on project storage rather than `$HOME`: it is 11 GB, and a lab can share one.
+
 ### First run
 
 ```bash
@@ -178,7 +197,8 @@ Recipe, if you go ahead: install Node and Claude Code in `$HOME`, and write a `p
 
 ## Known gaps / VERIFY
 
-- Partition names, GPU type strings, time limits, `module` names: confirm with `nuhpc check` and `module avail`.
+- Partition names, GPU type strings, time limits, `module` names: the example config reflects what one account saw on 2026-10-07. Confirm yours with `nuhpc check` and `module avail`.
+- `/scratch/$USER` can exist but be root-owned and unwritable. Check before pointing `HF_HOME` or `remote_root` at it.
 - Scratch purge policy: check RC's current rules. Treat `runs/` as temporary and `fetch` what you keep.
 - Globus support is a thin wrapper over the `globus` CLI. It needs `globus login` once plus both endpoint UUIDs in the config.
 - `status` uses `sacct`. If accounting lags, a brand-new run shows `SUBMITTED` for a few seconds.
