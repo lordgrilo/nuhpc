@@ -5,7 +5,7 @@ MODEL="$(hpc_param model)"
 TIMEOUT="$(hpc_param startup_timeout 1200)"
 ENTRY="$(hpc_param entry)"
 EXTRA="$(hpc_param args "")"
-VLLM_ARGS="$VLLM_ARGS"
+VLLM_ARGS="$(hpc_param vllm_args "")"
 PORT=$((8000 + RANDOM % 1000))   # shared nodes: avoid fixed ports
 export VLLM_URL="http://127.0.0.1:$PORT/v1" OPENAI_BASE_URL="http://127.0.0.1:$PORT/v1" OPENAI_API_KEY=EMPTY
 

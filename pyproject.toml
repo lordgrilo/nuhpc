@@ -12,5 +12,8 @@ nuhpc = "nuhpc.cli:main"
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+packages = ["nuhpc"]   # explicit: skill/ and examples/ would otherwise break flat-layout discovery
+
 [tool.setuptools.package-data]
 nuhpc = ["templates/*.sbatch", "example_config.toml"]
