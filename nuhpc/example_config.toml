@@ -1,0 +1,63 @@
+# nuhpc config: ~/.config/nuhpc/config.toml
+# Values marked VERIFY are guesses about Explorer: confirm with `nuhpc check` / RC docs.
+
+ssh_host = "explorer"                     # Host alias from ~/.ssh/config (see README)
+remote_root = "/scratch/YOUR_USER/nuhpc"  # all runs/, data/ live here. VERIFY scratch purge policy;
+                                          # anything you need to keep: fetch it, or use /projects/<group>.
+local_results = "~/nuhpc-results"
+templates_dir = ""                        # optional dir with your own *.sbatch templates (shadows built-ins)
+default_profile = "gpu1"
+
+# Pasted verbatim at the top of every job, after Slurm directives.
+env_setup = """
+module load cuda/12.1                          # VERIFY: `module avail cuda`
+source /projects/YOUR_GROUP/envs/llm/bin/activate
+export HF_HOME=/scratch/YOUR_USER/hf_cache     # keep model weights off $HOME (small quota)
+export HF_HUB_OFFLINE=1                        # GPU jobs read cached weights only
+export TOKENIZERS_PARALLELISM=false
+"""
+
+[limits]                         # guardrails, mainly for agents. --confirm-big bypasses them.
+max_gpu_hours_per_submit = 64    # worst case: gpus * nodes * walltime * tasks
+max_tasks = 200
+default_max_parallel = 8         # array throttle unless --max-parallel given
+fetch_max_file_size = "1G"       # fetch skips bigger files (checkpoints) unless --max-size
+
+# Profiles. Partition names, time limits and GPU types: VERIFY with `nuhpc check`.
+[profiles.cpu]
+partition = "short"
+cpus = 8
+mem = "32G"
+time = "04:00:00"
+
+[profiles.gpu1]
+partition = "gpu"
+cpus = 8
+mem = "64G"
+time = "08:00:00"
+gres = "gpu:1"
+
+[profiles.a100x1]
+partition = "gpu"
+cpus = 12
+mem = "120G"
+time = "08:00:00"
+gres = "gpu:a100:1"
+
+[profiles.h200x1]
+partition = "gpu"
+cpus = 16
+mem = "200G"
+time = "08:00:00"
+gres = "gpu:h200:1"
+
+[profiles.multigpu]              # 4 GPUs on one node, for 70B-class TP or DDP. May need RC approval. VERIFY
+partition = "multigpu"
+cpus = 32
+mem = "400G"
+time = "24:00:00"
+gres = "gpu:a100:4"
+
+[globus]                         # optional, for big transfers: `nuhpc push --globus`
+local_endpoint = ""              # your Globus Connect Personal endpoint UUID
+remote_endpoint = ""             # Northeastern RC endpoint UUID (search "Northeastern" in Globus)
