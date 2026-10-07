@@ -10,8 +10,11 @@ for mod in ("torch", "transformers", "vllm"):
         print(f"{mod}: NOT importable ({type(e).__name__})")
 try:
     import torch; print("cuda available:", torch.cuda.is_available(), "devices:", torch.cuda.device_count())
-except Exception:
-    pass
+    if torch.cuda.is_available():  # is_available() can pass while kernels fail, e.g. a driver older than the wheel's CUDA
+        x = torch.randn(1024, 1024, device="cuda"); (x @ x).sum().item()
+        print("cuda kernel: ok")
+except Exception as e:
+    print(f"cuda kernel: FAILED ({type(e).__name__}: {e})")
 PY
 echo "== HF_HOME=${HF_HOME:-unset} HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-unset}"
 code=$(curl -s -m 10 -o /dev/null -w "%{http_code}" https://huggingface.co || true)
