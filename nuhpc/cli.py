@@ -30,6 +30,8 @@ LEDGER = STATE_DIR / "ledger.jsonl"
 TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL",
             "PREEMPTED", "BOOT_FAIL", "DEADLINE"}
 DONE = {"COMPLETED", "FINISHED_WITH_FAILURES"}   # overall run states that `wait` stops on
+TRANSIENT_EXIT = {255, 10, 12, 30, 35}            # ssh connection failure; rsync socket/protocol/timeout errors
+RETRY_DELAYS = (5, 15)                            # seconds between attempts at a repeatable remote call
 DEFAULT_EXCLUDES = [".git", "__pycache__", ".venv", "venv", "*.pyc", ".ipynb_checkpoints",
                     "wandb", "outputs", "data", "*.ckpt", "*.safetensors", "*.pt", "*.bin"]
 RES_KEYS = ("partition", "time", "cpus", "mem", "gres", "nodes", "account", "constraint")
@@ -71,24 +73,33 @@ class Remote:
     def __init__(self, cfg: dict, dry: bool):
         self.cfg, self.host, self.dry = cfg, cfg["ssh_host"], dry
 
-    def _exec(self, argv: list[str], capture=True) -> str:
+    def _exec(self, argv: list[str], capture=True, retry=True) -> str:
         if self.dry:
             print("[dry-run] " + " ".join(shlex.quote(a) for a in argv), file=sys.stderr)
             return ""
-        try:
-            p = subprocess.run(argv, text=True, capture_output=capture)
-        except FileNotFoundError:
-            raise NuhpcError(f"'{argv[0]}' not found on this machine (install it)")
-        if p.returncode != 0:
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            try:
+                p = subprocess.run(argv, text=True, capture_output=capture)
+            except FileNotFoundError:
+                raise NuhpcError(f"'{argv[0]}' not found on this machine (install it)")
+            if p.returncode == 0:
+                return p.stdout if capture else ""
             err = (p.stderr or "").strip()
-            if "Permission denied" in err or "Host key" in err or "BatchMode" in err:
-                err += "\n(hint: run `nuhpc connect` to open an authenticated SSH session first)"
-            raise NuhpcError(f"command failed ({p.returncode}): {' '.join(argv[:3])} ...\n{err}")
-        return p.stdout if capture else ""
+            auth = "Permission denied" in err or "Host key" in err or "BatchMode" in err
+            # ssh 255 / rsync 10, 12, 30, 35: dropped or throttled connections. Retried only when the
+            # caller says the command is safe to repeat (never sbatch: a retry could submit twice).
+            if not (retry and not auth and p.returncode in TRANSIENT_EXIT and attempt < len(RETRY_DELAYS)):
+                break
+            print(f"[nuhpc] {argv[0]} connection failed (exit {p.returncode}); retrying in "
+                  f"{RETRY_DELAYS[attempt]}s", file=sys.stderr)
+            time.sleep(RETRY_DELAYS[attempt])
+        if auth:
+            err += "\n(hint: run `nuhpc connect` to open an authenticated SSH session first)"
+        raise NuhpcError(f"command failed ({p.returncode}): {' '.join(argv[:3])} ...\n{err}")
 
-    def run(self, cmd: str) -> str:
+    def run(self, cmd: str, retry=True) -> str:
         # Login shell so `module`, `sbatch`, etc. are on PATH.
-        return self._exec(["ssh", "-o", "BatchMode=yes", self.host, "bash -lc " + shlex.quote(cmd)])
+        return self._exec(["ssh", "-o", "BatchMode=yes", self.host, "bash -lc " + shlex.quote(cmd)], retry=retry)
 
     def rsync(self, src: str, dst: str, extra: list[str] | None = None) -> None:
         argv = ["rsync", "-az", "--partial", "-e", "ssh -o BatchMode=yes", *(extra or []), src, dst]
@@ -436,9 +447,10 @@ def cmd_templates(args, cfg, R):
     emit(rows, args)
 
 
-def cmd_submit(args, cfg, R, quiet=False):
+def cmd_submit(args, cfg, R, quiet=False, tasks=None):
     template = find_template(cfg, args.template)
-    tasks = build_tasks(args.sweep, args.grid, parse_kv(args.param))
+    if tasks is None:
+        tasks = build_tasks(args.sweep, args.grid, parse_kv(args.param))
     keys, packs = [], None
     if getattr(args, "pack", False):
         keys = pack_keys(template)
@@ -482,14 +494,14 @@ def cmd_submit(args, cfg, R, quiet=False):
         if (code / ".nuhpcignore").exists():
             ex.append(f"--exclude-from={code / '.nuhpcignore'}")
         R.rsync(f"{code}/", f"{host}:{run_dir}/code/", ex)
-    out = R.run(f"cd {shlex.quote(run_dir)} && sbatch --parsable job.sbatch")
+    out = R.run(f"cd {shlex.quote(run_dir)} && sbatch --parsable job.sbatch", retry=False)
     job_id = out.strip().split(";")[0] if out.strip() else "DRY-RUN"
     result = {**meta, "job_id": job_id, "remote_dir": run_dir, "local_stage": str(stage)}
     if not args.dry_run:
         ledger_append({k: result[k] for k in ("run_id", "job_id", "template", "profile", "n_tasks",
                                              "remote_dir", "created", "worst_case_gpu_hours")})
     if quiet:
-        return {"run_id": run_id, "job_id": job_id}
+        return {"run_id": run_id, "job_id": job_id, "local_stage": str(stage)}
     emit(result, args)
 
 
@@ -537,10 +549,10 @@ def cmd_status(args, cfg, R):
     emit(run_states(entries, R)[0], args)
 
 
-def cmd_wait(args, cfg, R):
-    entries = [find_run(r) for r in args.run]
-    deadline = None if args.timeout is None else time.monotonic() + args.timeout
-    delay, errors, rows, failed, last = args.interval, 0, [], {}, None
+def wait_for(entries: list[dict], R, timeout: float | None, interval: float, dry: bool):
+    """Poll until every run is done or the timeout passes. Returns (rows, failed, timed_out)."""
+    deadline = None if timeout is None else time.monotonic() + timeout
+    delay, errors, rows, failed, last = interval, 0, [], {}, None
     while True:
         try:
             rows, failed = run_states(entries, R)
@@ -555,13 +567,20 @@ def cmd_wait(args, cfg, R):
             print(f"[wait] {datetime.now():%H:%M:%S} "
                   + " ".join(f"{r['run_id']}={r['state']}({r['done']})" for r in rows), file=sys.stderr)
             last = states
-        if args.dry_run or (rows and all(s in DONE for s in states)):
-            break
+        if dry or (rows and all(s in DONE for s in states)):
+            return rows, failed, False
         if deadline is not None and time.monotonic() >= deadline:
-            emit({"timed_out": True, "runs": rows} if args.json else rows, args)
-            sys.exit(3)
+            return rows, failed, True
         time.sleep(delay if deadline is None else max(0.0, min(delay, deadline - time.monotonic())))
         delay = min(delay * 1.5, 300)
+
+
+def cmd_wait(args, cfg, R):
+    entries = [find_run(r) for r in args.run]
+    rows, failed, timed_out = wait_for(entries, R, args.timeout, args.interval, args.dry_run)
+    if timed_out:
+        emit({"timed_out": True, "runs": rows} if args.json else rows, args)
+        sys.exit(3)
     for r, e in zip(rows, entries):
         bad = sorted(failed.get(e["job_id"], []))
         if bad:
@@ -576,6 +595,36 @@ def cmd_wait(args, cfg, R):
     for r in rows:
         if r.get("failed_log_tail"):
             print(f"\n== {r['run_id']}: log of task {r['failed_tasks'][0]} (first failed) ==\n{r['failed_log_tail']}", end="")
+
+
+def cmd_run(args, cfg, R):
+    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    if not command:
+        raise NuhpcError("nothing to run: nuhpc run [options] -- COMMAND [ARGS...]")
+    if args.time is None:
+        args.time = "00:30:00"   # a quick test, not the profile's batch walltime
+    args.template, args.name = "cmd", args.name or "run"
+    args.sweep = args.grid = args.param = args.max_parallel = None
+    args.confirm_big = args.pack = False
+    sub = cmd_submit(args, cfg, R, quiet=True, tasks=[{"cmd": shlex.join(command)}])
+    if args.dry_run:
+        return emit(sub, args)
+    e = find_run(sub["run_id"])
+    rows, _, timed_out = wait_for([e], R, args.timeout, args.interval, False)
+    state = rows[0]["state"] if rows else "SUBMITTED"
+    if timed_out:
+        emit({"run_id": e["run_id"], "job_id": e["job_id"], "state": state, "timed_out": True,
+              "next": f"nuhpc wait {e['run_id']}"}, args)
+        sys.exit(3)
+    log = log_tail(R, e, 0, args.lines)
+    dest, _ = fetch_run(cfg, R, e)
+    if args.json:
+        emit({"run_id": e["run_id"], "job_id": e["job_id"], "state": state, "log": log, "local": str(dest)}, args)
+    else:
+        print(log, end="")
+        print(f"[nuhpc run] {e['run_id']}: {state}; outputs in {dest}", file=sys.stderr)
+    if state != "COMPLETED":
+        sys.exit(2)
 
 
 def log_tail(R, e: dict, task: int, n: int, grep: str | None = None) -> str:
@@ -594,19 +643,24 @@ def cmd_logs(args, cfg, R):
         print(out, end="")
 
 
-def cmd_fetch(args, cfg, R):
-    e = find_run(args.run)
+def fetch_run(cfg, R, e: dict, include=None, max_size=None) -> tuple[Path, str | None]:
     dest = Path(cfg["local_results"]).expanduser() / e["run_id"]
     dest.mkdir(parents=True, exist_ok=True)
     extra = []
-    max_size = args.max_size or cfg["limits"].get("fetch_max_file_size")
+    max_size = max_size or cfg["limits"].get("fetch_max_file_size")
     if max_size:
         extra.append(f"--max-size={max_size}")
-    if args.include:
-        extra += ["-m", "--include=*/", *[f"--include={p}" for p in args.include], "--exclude=*"]
+    if include:
+        extra += ["-m", "--include=*/", *[f"--include={p}" for p in include], "--exclude=*"]
     for sub in ("outputs", "logs"):
         R.rsync(f"{cfg['ssh_host']}:{e['remote_dir']}/{sub}/", f"{dest}/{sub}/", extra)
     R.rsync(f"{cfg['ssh_host']}:{e['remote_dir']}/meta.json", f"{dest}/meta.json")
+    return dest, max_size
+
+
+def cmd_fetch(args, cfg, R):
+    e = find_run(args.run)
+    dest, max_size = fetch_run(cfg, R, e, args.include, args.max_size)
     emit({"run_id": e["run_id"], "local": str(dest), "max_file_size": max_size or "none"}, args)
 
 
@@ -659,7 +713,7 @@ def _globus(cfg, R, args, local, remote, to_remote):
     a, b = f"{g['local_endpoint']}:{local}", f"{g['remote_endpoint']}:{remote}"
     argv = ["globus", "transfer", "--recursive", "--sync-level", "checksum", "--label", "nuhpc",
             "--jmespath", "task_id", "--format", "unix", *((a, b) if to_remote else (b, a))]
-    out = R._exec(argv)
+    out = R._exec(argv, retry=False)   # a repeated transfer request would duplicate it
     emit({"globus_task": out.strip() or "DRY-RUN", "wait_with": f"globus task wait {out.strip()}"}, args)
 
 
@@ -725,6 +779,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="one array task per group of rows sharing the template's pack-by keys "
                         "(vllm_eval: one server per model, the client runs once per row)")
     add_resource_flags(p)
+
+    p = sub("run", cmd_run, "quick test: run COMMAND on a compute node (30 min unless --time), wait, "
+                            "print its output, fetch $HPC_OUT")
+    p.add_argument("--name")
+    p.add_argument("--code", help="local project dir to snapshot; COMMAND runs inside it")
+    p.add_argument("--timeout", type=float, help="stop waiting after this many seconds: exit 3, the job keeps going")
+    p.add_argument("--interval", type=float, default=15, help="first poll interval in s")
+    p.add_argument("-n", "--lines", type=int, default=200, help="log lines printed at the end")
+    add_resource_flags(p)
+    p.add_argument("command", nargs=argparse.REMAINDER, help="-- COMMAND [ARGS...]")
 
     p = sub("status", cmd_status, "state of runs (default: last 10)")
     p.add_argument("run", nargs="*")

@@ -15,7 +15,7 @@ from nuhpc import cli
 @pytest.fixture
 def env(tmp_path):
     cfg = tmp_path / "config.toml"
-    cfg.write_text(f'ssh_host = "nowhere"\nremote_root = "{tmp_path}/remote"\n'
+    cfg.write_text(f'ssh_host = "nowhere"\nremote_root = "{tmp_path}/remote"\nlocal_results = "{tmp_path}/results"\n'
                    '[limits]\nmax_gpu_hours_per_submit = 10\nmax_tasks = 5\n')
     return {**os.environ, "NUHPC_CONFIG": str(cfg), "NUHPC_STATE": str(tmp_path / "state")}
 
@@ -139,8 +139,10 @@ def inproc(tmp_path, env, monkeypatch):
     def install(sacct_replies, other=""):
         it = iter(sacct_replies)
 
-        def fake_run(self, cmd):
+        def fake_run(self, cmd, retry=True):
             calls.append(cmd)
+            if "sbatch" in cmd:
+                return "555\n"
             if not cmd.startswith("sacct"):
                 return other
             r = next(it)
@@ -148,6 +150,7 @@ def inproc(tmp_path, env, monkeypatch):
                 raise r
             return r
         monkeypatch.setattr(cli.Remote, "run", fake_run)
+        monkeypatch.setattr(cli.Remote, "rsync", lambda self, *a, **k: None)
         return calls
     return install
 
@@ -187,6 +190,52 @@ def test_logs_grep_quotes_pattern_for_remote_shell(inproc, capsys):
     cmd = calls[-1]
     assert "grep -h -E -e '^\\[p|Traceback; rm -rf ~'" in cmd and cmd.endswith("| tail -n 80")
     assert "s/trial" in json.loads(capsys.readouterr().out)["log"]
+
+
+def test_cmd_template_runs_any_command(tmp_path, env):
+    rc, res = nuhpc(env, "submit", "cmd", "--partition", "short", "-p", 'cmd=echo hello > "$HPC_OUT/out.txt"')
+    assert rc == 0
+    run_dir, p = run_job(tmp_path, env, res, {})
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert (run_dir / "outputs/task_0/out.txt").read_text().strip() == "hello"
+
+
+def test_run_submits_waits_and_returns_output(inproc, capsys, tmp_path):
+    inproc(["555|PENDING|0:00|0:0\n", "555|COMPLETED|0:10|0:0\n"], other="hello from the GPU\n")
+    cli.main(["--json", "run", "--partition", "gpu-short", "--", "python", "probe.py", "--n", "3"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["state"] == "COMPLETED" and "hello from the GPU" in out["log"]
+    stage = tmp_path / "state" / "runs" / out["run_id"]
+    assert json.loads((stage / "sweep.jsonl").read_text())["cmd"] == "python probe.py --n 3"
+    assert "#SBATCH --time=00:30:00" in (stage / "job.sbatch").read_text()
+
+
+def test_run_exits_2_when_the_command_fails(inproc, capsys):
+    inproc(["555|FAILED|0:10|1:0\n"], other="Traceback\n")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--json", "run", "--partition", "short", "--", "false"])
+    assert e.value.code == 2 and json.loads(capsys.readouterr().out)["state"] == "FINISHED_WITH_FAILURES"
+
+
+def test_transport_retries_repeatable_calls_only(monkeypatch):
+    seq, stderr = [], ["ssh: connect to host x port 22: Connection reset"]
+
+    def fake_sp_run(argv, **kw):
+        seq.append(argv)
+        rc = 0 if len(seq) >= 3 else 255
+        return subprocess.CompletedProcess(argv, rc, stdout="ok\n", stderr=stderr[0])
+    monkeypatch.setattr(cli.subprocess, "run", fake_sp_run)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    R = cli.Remote({"ssh_host": "h"}, dry=False)
+    assert R.run("sacct -j 1") == "ok\n" and len(seq) == 3          # two transient failures, then success
+    seq.clear()
+    with pytest.raises(cli.NuhpcError):
+        R.run("cd x && sbatch --parsable job.sbatch", retry=False)   # never resubmit
+    assert len(seq) == 1
+    seq.clear(); stderr[0] = "Permission denied (publickey)."
+    with pytest.raises(cli.NuhpcError, match="nuhpc connect"):
+        R.run("sacct -j 1")                                          # auth failures are not transient
+    assert len(seq) == 1
 
 
 def test_missing_required_param_aborts_job(tmp_path, env):

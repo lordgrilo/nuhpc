@@ -10,7 +10,10 @@ You reach the cluster only through `nuhpc`. Never call `ssh`, `scp`, `rsync` or 
 ## Workflow
 
 1. **Orient.** Run `nuhpc --json templates` to see the templates and their params (read the descriptions; don't guess). Run `nuhpc --json check` if you don't yet know whether SSH works.
-2. **Pick the template by what you need from the model.**
+2. **Pick the mode by what you need.** The README's "Which mode?" table has the measured costs.
+   - **Quick check** (does it import, does CUDA work, how long does one batch take):
+     `nuhpc --json run --timeout 540 --code <dir> --profile a100x1 --partition gpu-short -- python probe.py`.
+     It runs any command with no contract, 30 minutes unless `--time`, and returns the log and fetched `$HPC_OUT`. Exit 2 means the command failed (the log says why); exit 3 means it's still queued or running, so follow it with `nuhpc wait <run_id>`.
    - **Logits, log-probs, hidden states, forced prefixes:** `python`. Your script loads the model with transformers. Run one task per model and loop over every condition inside it. Worked example: `run_vlm.py` in `miller-science/code/stroop_vlm/`, which took about 15 GPU-minutes for 9,500 trials on a 7B VLM.
    - **Generated text at scale** (evals, prompt or sampling sweeps): `vllm_eval` with `--pack`. Rows that share a model then share one vLLM server, and the client runs once per row (`outputs/task_K/row_R/`).
    - **Weights:** run `hf_download` first, because jobs run with `HF_HUB_OFFLINE=1`.
