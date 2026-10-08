@@ -164,7 +164,7 @@ The template starts an OpenAI-compatible vLLM server on the node, waits until it
 
 With `--pack`, rows that share a model (and its `vllm_args`) run in one task against one server, so the grid above is 2 tasks, not 4. Results land in `outputs/task_K/row_R/`. Size `--time` for all rows of a pack: up to 20 minutes of startup plus the client's work.
 
-`examples/vlm_client.py` sends images: local files go inline as base64, and URLs pass through. `examples/eval_client.py` is the text-only version. Both resume. Verified on 2026-10-08 with Qwen2.5-VL-3B on an A100.
+`examples/vlm_client.py` sends images: local files go inline as base64, and URLs pass through. `examples/eval_client.py` is the text-only version. Both resume. Verified on 2026-10-08 with Qwen2.5-VL-3B on an A100, including `--pack`: one server (up in 100 s) served a temperature 0 row and a temperature 0.7 row.
 
 Model size drives queue time more than anything else: one A100-80GB or H200 job usually starts before a four-GPU job. Keep `--max-parallel` modest on the shared queue.
 
