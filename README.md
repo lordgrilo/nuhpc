@@ -127,6 +127,14 @@ The environment and the HF cache sit wherever your `env_setup` points; ours are 
 
 **Costs.** Every submit reports `worst_case_gpu_hours` (GPUs × nodes × walltime × tasks). Anything above the limits in your config needs `--confirm-big`. Keep `--time` near the real runtime: shorter jobs schedule sooner.
 
+**Cleaning up.** Run folders stay in `runs/` until you delete them: a few KB of logs for a test, MB of outputs for an experiment. `fetch` what you keep, then delete old runs yourself:
+
+```bash
+ssh YOUR_NU_USERNAME@login.explorer.northeastern.edu 'cd <remote_root>/runs && rm -rf -- <run_id> <run_id>'
+```
+
+There is deliberately no `nuhpc` delete command, so an agent allowed to run `nuhpc` cannot destroy results. Deleting a run folder leaves alone its ledger entry (history), its fetched copy in `~/nuhpc-results/`, and any weights it cached in `HF_HOME`; `logs` and `fetch` on that run fail afterwards. The local staging copies in `~/.local/share/nuhpc/runs/` can go at any time. To delete something with thousands of files, such as an old Python environment, do it inside a job with parallel deletes (`find DIR -type f -print0 | xargs -0 -P 16 rm -f`): file operations on `/projects` cost about 0.1 s each.
+
 ## Workflows
 
 ### Quick tests: `nuhpc run`
