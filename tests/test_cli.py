@@ -83,6 +83,17 @@ def test_vllm_eval_runs_without_optional_params(tmp_path, env):
     assert (run_dir / "outputs/task_0/client_ran").exists()
 
 
+def test_vllm_eval_health_check_bypasses_cluster_proxy(tmp_path, env):
+    # Explorer jobs inherit http_proxy; curl must not send the localhost health check through it.
+    rc, res = nuhpc(env, "submit", "vllm_eval", "--partition", "gpu", "--gres", "gpu:1",
+                    "-p", "model=m", "-p", "entry=client.py", "-p", "startup_timeout=0")
+    assert rc == 0
+    curl = '[ -z "${http_proxy:-}" ] || [[ ",${no_proxy:-}," == *",127.0.0.1,"* ]] || exit 7'
+    _, p = run_job(tmp_path, {**env, "http_proxy": "http://10.99.0.130:3128"}, res,
+                   {"vllm": "sleep 30", "curl": curl, "python": "exit 0"})
+    assert p.returncode == 0, p.stdout + p.stderr
+
+
 def test_missing_required_param_aborts_job(tmp_path, env):
     rc, res = nuhpc(env, "submit", "python", "--partition", "short")
     assert rc == 0

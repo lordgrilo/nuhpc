@@ -53,7 +53,8 @@ Jobs activate whatever `env_setup` names, so build that environment once, **insi
 
 ```bash
 # in an sbatch script (-p short -c 8 --mem=32G -t 06:00:00), or under `srun ... --pty bash`
-export UV_CACHE_DIR=/tmp/$USER-uv UV_LINK_MODE=copy
+export UV_CACHE_DIR=/tmp/$USER-uv UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1   # precompile: first imports otherwise
+                                               # write each .pyc serially to /projects (stalled vLLM for 17 min)
 export UV_PYTHON_INSTALL_DIR=/projects/YOUR_GROUP/envs/.python   # the venv's interpreter must exist on every node
 /shared/EL9/explorer/anaconda3/2024.06/bin/python3 -m pip install --target /tmp/$USER-uvbin uv
 /tmp/$USER-uvbin/bin/uv venv --python 3.12 /projects/YOUR_GROUP/envs/llm
@@ -144,11 +145,13 @@ nuhpc status vlm-eval
 nuhpc fetch vlm-eval --include '*.json' --include '*.jsonl'
 ```
 
-`examples/eval_client.py` is a minimal client that follows the contract. For VLMs, send image content parts in the usual OpenAI chat format, and push the images to `data/`.
+`examples/eval_client.py` is a minimal text client that follows the contract. `examples/vlm_client.py` sends images: put a `prompts.jsonl` (`{"id", "prompt", "image"}` per line) and the images in one folder, `nuhpc push` it, and pass `-p prompts=<remote path>/prompts.jsonl`. Verified on 2026-10-08 with Qwen2.5-VL-3B on an A100.
 
 For 70B-class models, use a multi-GPU profile (`--gpus 4`). vLLM picks the tensor-parallel size up automatically from the template.
 
-Two practical points:
+Three practical points:
+
+- **Each task restarts vLLM**, which took 2–19 minutes on Explorer: fast on a node that has read the weights recently, slow on a cold one. So sweep *models* across array tasks, and loop over cheap settings like temperature or prompt variants inside one task's client.
 
 - Model size drives your queue time more than anything else: one H200 or A100-80GB job usually starts faster than a four-GPU job.
 - Keep `max_parallel` modest so you don't monopolise the shared GPU queue.
@@ -202,4 +205,5 @@ Recipe, if you go ahead: install Node and Claude Code in `$HOME`, and write a `p
 - Scratch purge policy: check RC's current rules. Treat `runs/` as temporary and `fetch` what you keep.
 - Globus support is a thin wrapper over the `globus` CLI. It needs `globus login` once plus both endpoint UUIDs in the config.
 - `status` uses `sacct`. If accounting lags, a brand-new run shows `SUBMITTED` for a few seconds.
+- Jobs inherit the cluster's `http_proxy` (the compute nodes' route to the internet). Anything that talks to a server on the node itself must bypass it with `no_proxy`; `vllm_eval` sets this for 127.0.0.1.
 - The ledger is local to each machine. Runs submitted from another laptop are visible in `queue`, but not in `runs` or `status`.
