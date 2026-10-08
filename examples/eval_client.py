@@ -16,8 +16,12 @@ out = Path(a.out)
 client = OpenAI(base_url=os.environ["OPENAI_BASE_URL"], api_key="EMPTY")
 prompts = [json.loads(l) for l in open(p["prompts"])]   # e.g. {DATA}/prompts.jsonl, {"id":..,"prompt":..}
 t0 = time.time()
-with open(out / "completions.jsonl", "w") as f:
+path = out / "completions.jsonl"   # resumable: rows already written (by an interrupted run) are skipped
+done = {json.loads(l)["id"] for l in path.read_text().splitlines() if l.strip()} if path.exists() else set()
+with open(path, "a") as f:
     for ex in prompts:
+        if ex["id"] in done:
+            continue
         r = client.chat.completions.create(
             model=p["model"], messages=[{"role": "user", "content": ex["prompt"]}],
             temperature=p.get("temperature", 0.0), max_tokens=p.get("max_tokens", 512))

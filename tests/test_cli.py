@@ -94,6 +94,101 @@ def test_vllm_eval_health_check_bypasses_cluster_proxy(tmp_path, env):
     assert p.returncode == 0, p.stdout + p.stderr
 
 
+def test_pack_rows_groups_by_keys_in_order():
+    rows = [{"model": "a", "t": 0}, {"model": "b", "t": 0}, {"model": "a", "t": 1}]
+    assert cli.pack_rows(rows, ["model", "vllm_args"]) == [[0, 2], [1]]
+
+
+def test_pack_requires_template_support(env):
+    rc, out = nuhpc(env, "submit", "python", "--partition", "short", "-p", "entry=x.py", "--pack")
+    assert rc == 1 and "does not support --pack" in out["error"]
+
+
+def test_packed_vllm_eval_starts_one_server_per_model(tmp_path, env):
+    rc, res = nuhpc(env, "submit", "vllm_eval", "--partition", "gpu", "--gres", "gpu:1", "-p", "entry=client.py",
+                    "--grid", "model=a,b", "--grid", "temperature=0,0.7", "--pack")
+    assert rc == 0 and res["n_tasks"] == 2 and res["n_rows"] == 4
+    run_dir = Path(res["remote_dir"])
+    shutil.copytree(res["local_stage"], run_dir)
+    (run_dir / "code").mkdir()
+    starts = tmp_path / "vllm_starts"
+    client = ('while [ $# -gt 0 ]; do case $1 in --params) P=$2; shift;; --out) O=$2; shift;; esac; shift; done; '
+              'cp "$P" "$O/seen.json"')
+    path = f"{stub_bin(tmp_path, vllm=f'echo x >> {starts}; sleep 30', curl='exit 0', python=client)}:{env['PATH']}"
+    for task in (0, 1):
+        p = subprocess.run(["bash", str(run_dir / "job.sbatch")], capture_output=True, text=True, timeout=60,
+                           env={**env, "PATH": path, "SLURM_ARRAY_TASK_ID": str(task)})
+        assert p.returncode == 0, p.stdout + p.stderr
+    assert starts.read_text().count("x") == 2
+    seen = json.loads((run_dir / "outputs/task_1/row_3/seen.json").read_text())
+    assert seen["model"] == "b" and seen["temperature"] == 0.7
+
+
+@pytest.fixture
+def inproc(tmp_path, env, monkeypatch):
+    """Run cli.main in-process against a fake transport: replies maps a command prefix to outputs."""
+    monkeypatch.setattr(cli, "CONFIG_PATH", Path(env["NUHPC_CONFIG"]))
+    monkeypatch.setattr(cli, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(cli, "LEDGER", tmp_path / "state" / "ledger.jsonl")
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    cli.ledger_append({"run_id": "r1-20260101-000000", "job_id": "100", "template": "python", "profile": None,
+                       "n_tasks": 3, "remote_dir": "/r/runs/r1-20260101-000000", "created": "x",
+                       "worst_case_gpu_hours": 0})
+    calls = []
+
+    def install(sacct_replies, other=""):
+        it = iter(sacct_replies)
+
+        def fake_run(self, cmd):
+            calls.append(cmd)
+            if not cmd.startswith("sacct"):
+                return other
+            r = next(it)
+            if isinstance(r, Exception):
+                raise r
+            return r
+        monkeypatch.setattr(cli.Remote, "run", fake_run)
+        return calls
+    return install
+
+
+def test_wait_reports_final_states_and_failed_task_log(inproc, capsys):
+    calls = inproc(["100_[0-2]|PENDING|0:00|0:0\n",
+                    "100_0|COMPLETED|1:00|0:0\n100_1|FAILED|0:30|1:0\n100_2|RUNNING|1:00|0:0\n",
+                    "100_0|COMPLETED|1:00|0:0\n100_1|FAILED|0:30|1:0\n100_2|COMPLETED|2:00|0:0\n"],
+                   other="Traceback: boom\n")
+    cli.main(["--json", "wait", "r1", "--interval", "1"])
+    out = json.loads(capsys.readouterr().out)
+    run = out["runs"][0]
+    assert out["timed_out"] is False and run["state"] == "FINISHED_WITH_FAILURES"
+    assert run["failed_tasks"] == [1] and "boom" in run["failed_log_tail"]
+    assert sum(c.startswith("sacct") for c in calls) == 3
+
+
+def test_wait_timeout_exits_3_with_states(inproc, capsys):
+    inproc(["100_[0-2]|PENDING|0:00|0:0\n"] * 5)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--json", "wait", "r1", "--timeout", "0"])
+    assert e.value.code == 3
+    out = json.loads(capsys.readouterr().out)
+    assert out["timed_out"] is True and out["runs"][0]["state"] == "PENDING"
+
+
+def test_wait_survives_transient_transport_errors(inproc, capsys):
+    inproc([cli.NuhpcError("ssh: connect to host: Can't assign requested address")] * 3
+           + ["100_0|COMPLETED|1:00|0:0\n100_1|COMPLETED|1:00|0:0\n100_2|COMPLETED|1:00|0:0\n"])
+    cli.main(["--json", "wait", "r1"])
+    assert json.loads(capsys.readouterr().out)["runs"][0]["state"] == "COMPLETED"
+
+
+def test_logs_grep_quotes_pattern_for_remote_shell(inproc, capsys):
+    calls = inproc([], other="[p1] 24/300 0.54s/trial\n")
+    cli.main(["--json", "logs", "r1", "--task", "2", "--grep", "^\\[p|Traceback; rm -rf ~"])
+    cmd = calls[-1]
+    assert "grep -h -E -e '^\\[p|Traceback; rm -rf ~'" in cmd and cmd.endswith("| tail -n 80")
+    assert "s/trial" in json.loads(capsys.readouterr().out)["log"]
+
+
 def test_missing_required_param_aborts_job(tmp_path, env):
     rc, res = nuhpc(env, "submit", "python", "--partition", "short")
     assert rc == 0

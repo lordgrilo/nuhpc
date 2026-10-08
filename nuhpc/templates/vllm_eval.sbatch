@@ -1,6 +1,9 @@
 # doc: Serve a model with vLLM on the node, run your client script against it, then shut down. Works for LLMs and the VLMs vLLM supports.
 # doc: Params: model (HF id or local path), entry (client script in --code). Optional: vllm_args, startup_timeout (s, default 2700: ~19 min observed on Explorer, network storage), args.
 # doc: The client gets OPENAI_BASE_URL / VLLM_URL (OpenAI-compatible API). Tensor parallel size = GPUs per node.
+# doc: --pack: rows sharing model/vllm_args/startup_timeout/entry/args share one server (startup takes 2-19 min);
+# doc: the client then runs once per row, writing to outputs/task_K/row_R. Size --time for all rows of a pack.
+# pack-by: model vllm_args startup_timeout entry args
 MODEL="$(hpc_param model)"
 TIMEOUT="$(hpc_param startup_timeout 2700)"
 ENTRY="$(hpc_param entry)"
@@ -25,4 +28,5 @@ done
 echo "[nuhpc] vLLM up after ${waited}s at $VLLM_URL"
 
 cd "{{CODE}}"
-python "$ENTRY" --params "$HPC_PARAMS" --out "$HPC_OUT" $EXTRA
+run_client() { python "$ENTRY" --params "$HPC_ROW_PARAMS" --out "$HPC_ROW_OUT" $EXTRA; }
+hpc_each_row run_client

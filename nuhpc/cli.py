@@ -17,6 +17,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 import tomllib
 from datetime import datetime
 from importlib import resources
@@ -28,6 +29,7 @@ LEDGER = STATE_DIR / "ledger.jsonl"
 
 TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL",
             "PREEMPTED", "BOOT_FAIL", "DEADLINE"}
+DONE = {"COMPLETED", "FINISHED_WITH_FAILURES"}   # overall run states that `wait` stops on
 DEFAULT_EXCLUDES = [".git", "__pycache__", ".venv", "venv", "*.pyc", ".ipynb_checkpoints",
                     "wandb", "outputs", "data", "*.ckpt", "*.safetensors", "*.pt", "*.bin"]
 RES_KEYS = ("partition", "time", "cpus", "mem", "gres", "nodes", "account", "constraint")
@@ -200,6 +202,22 @@ def find_template(cfg: dict, name: str) -> Path:
     raise NuhpcError(f"template '{name}' not found (try `nuhpc templates`)")
 
 
+def pack_keys(template: Path) -> list[str]:
+    """Params a template needs uniform within one array task, from its '# pack-by:' line."""
+    for line in template.read_text().splitlines():
+        if line.startswith("# pack-by:"):
+            return line[len("# pack-by:"):].split()
+    return []
+
+
+def pack_rows(tasks: list[dict], keys: list[str]) -> list[list[int]]:
+    """Group row indices by their values on `keys`, in order of first appearance."""
+    groups: dict[str, list[int]] = {}
+    for i, t in enumerate(tasks):
+        groups.setdefault(json.dumps([t.get(k) for k in keys], sort_keys=True), []).append(i)
+    return list(groups.values())
+
+
 def all_templates(cfg: dict) -> list[Path]:
     dirs = [Path(str(resources.files("nuhpc") / "templates"))]
     if cfg["templates_dir"]:
@@ -220,7 +238,32 @@ export HPC_TASK_ID="${{SLURM_ARRAY_TASK_ID:-0}}"
 export HPC_OUT="$HPC_RUN_DIR/outputs/task_$HPC_TASK_ID"
 export HPC_PARAMS="$HPC_OUT/params.json"
 mkdir -p "$HPC_OUT"
-sed -n "$((HPC_TASK_ID + 1))p" "$HPC_RUN_DIR/sweep.jsonl" > "$HPC_PARAMS"
+# Rows (sweep.jsonl line indices) this task runs: its own, or a group under --pack (packs.json).
+if [ -f "$HPC_RUN_DIR/packs.json" ]; then
+  HPC_ROWS="$(python3 -c 'import json,sys; print(*json.load(open(sys.argv[1]))[int(sys.argv[2])])' "$HPC_RUN_DIR/packs.json" "$HPC_TASK_ID")"
+else
+  HPC_ROWS="$HPC_TASK_ID"
+fi
+export HPC_ROWS
+sed -n "$((${{HPC_ROWS%% *}} + 1))p" "$HPC_RUN_DIR/sweep.jsonl" > "$HPC_PARAMS"
+
+# hpc_each_row CMD...: run CMD once per row of this task, with HPC_ROW, HPC_ROW_PARAMS, HPC_ROW_OUT set.
+# Unpacked runs keep the flat layout (outputs/task_K); packed rows write to outputs/task_K/row_R.
+# A failing row doesn't stop the others; the task fails at the end if any row did.
+hpc_each_row() {{
+  if [ ! -f "$HPC_RUN_DIR/packs.json" ]; then
+    HPC_ROW="$HPC_TASK_ID" HPC_ROW_PARAMS="$HPC_PARAMS" HPC_ROW_OUT="$HPC_OUT" "$@"; return
+  fi
+  local r rc=0
+  for r in $HPC_ROWS; do
+    export HPC_ROW="$r" HPC_ROW_OUT="$HPC_OUT/row_$r" HPC_ROW_PARAMS="$HPC_OUT/row_$r/params.json"
+    mkdir -p "$HPC_ROW_OUT"
+    sed -n "$((r + 1))p" "$HPC_RUN_DIR/sweep.jsonl" > "$HPC_ROW_PARAMS"
+    echo "[nuhpc] row $r: $(cat "$HPC_ROW_PARAMS")"
+    "$@" || {{ rc=$?; echo "[nuhpc] row $r failed (exit $rc)"; }}
+  done
+  return $rc
+}}
 
 # hpc_param KEY [DEFAULT]: read a parameter of this task (strings raw, others as JSON).
 hpc_param() {{
@@ -396,7 +439,13 @@ def cmd_templates(args, cfg, R):
 def cmd_submit(args, cfg, R, quiet=False):
     template = find_template(cfg, args.template)
     tasks = build_tasks(args.sweep, args.grid, parse_kv(args.param))
-    n = len(tasks)
+    keys, packs = [], None
+    if getattr(args, "pack", False):
+        keys = pack_keys(template)
+        if not keys:
+            raise NuhpcError(f"template '{template.stem}' does not support --pack (no '# pack-by:' line)")
+        packs = pack_rows(tasks, keys)
+    n = len(packs) if packs else len(tasks)   # array tasks: what reaches the queue and the limits
     prof, res = resolve_resources(cfg, args)
     gpu_h = gpus_per_node(res) * int(res["nodes"]) * time_hours(res["time"]) * n
     lim = cfg["limits"]
@@ -413,7 +462,10 @@ def cmd_submit(args, cfg, R, quiet=False):
     stage.mkdir(parents=True, exist_ok=True)
     (stage / "job.sbatch").write_text(render(cfg, template, res, n, max_par, run_id, run_dir, slug(args.name or template.stem)))
     (stage / "sweep.jsonl").write_text("".join(json.dumps(t) + "\n" for t in tasks))
+    if packs:
+        (stage / "packs.json").write_text(json.dumps(packs))
     meta = {"run_id": run_id, "template": template.stem, "profile": prof, "resources": res, "n_tasks": n,
+            "n_rows": len(tasks), "pack_by": keys or None,
             "max_parallel": max_par, "worst_case_gpu_hours": round(gpu_h, 2), "code": args.code,
             "created": datetime.now().isoformat(timespec="seconds")}
     (stage / "meta.json").write_text(json.dumps(meta, indent=2))
@@ -441,25 +493,22 @@ def cmd_submit(args, cfg, R, quiet=False):
     emit(result, args)
 
 
-def cmd_status(args, cfg, R):
-    entries = ledger_read()
-    if args.run:
-        entries = [find_run(r) for r in args.run]
-    else:
-        entries = entries[-args.last:]
-    if not entries:
-        return emit([], args)
+def run_states(entries: list[dict], R) -> tuple[list[dict], dict[str, list[int]]]:
+    """Overall state per run from sacct, plus the array task ids that ended badly, per job id."""
     ids = ",".join(e["job_id"] for e in entries)
     out = R.run(f"sacct -X -n -P --format=JobID,State,Elapsed,ExitCode -j {ids}")
     counts: dict[str, dict[str, int]] = {}
+    failed: dict[str, list[int]] = {}
     for line in out.splitlines():
         parts = line.split("|")
         if len(parts) < 4:
             continue
-        base = parts[0].split("_")[0]
+        base, _, idx = parts[0].partition("_")
         state = parts[1].split()[0]
         counts.setdefault(base, {}).setdefault(state, 0)
         counts[base][state] += array_count(parts[0])
+        if state in TERMINAL and state != "COMPLETED" and not idx.startswith("["):
+            failed.setdefault(base, []).append(int(idx or 0))
     rows = []
     for e in entries:
         c = counts.get(e["job_id"], {})
@@ -478,13 +527,67 @@ def cmd_status(args, cfg, R):
             overall = "MIXED"
         rows.append({"run_id": e["run_id"], "job_id": e["job_id"], "state": overall,
                      "done": f"{done}/{e['n_tasks']}", "breakdown": ",".join(f"{k}={v}" for k, v in sorted(c.items()))})
-    emit(rows, args)
+    return rows, failed
+
+
+def cmd_status(args, cfg, R):
+    entries = [find_run(r) for r in args.run] if args.run else ledger_read()[-args.last:]
+    if not entries:
+        return emit([], args)
+    emit(run_states(entries, R)[0], args)
+
+
+def cmd_wait(args, cfg, R):
+    entries = [find_run(r) for r in args.run]
+    deadline = None if args.timeout is None else time.monotonic() + args.timeout
+    delay, errors, rows, failed, last = args.interval, 0, [], {}, None
+    while True:
+        try:
+            rows, failed = run_states(entries, R)
+            errors = 0
+        except NuhpcError as ex:   # laptop asleep, network blip: keep waiting, but not forever
+            errors += 1
+            if errors >= 10:
+                raise
+            print(f"[wait] transport error {errors}/10: {str(ex).splitlines()[-1]}", file=sys.stderr)
+        states = [r["state"] for r in rows]
+        if states and states != last:
+            print(f"[wait] {datetime.now():%H:%M:%S} "
+                  + " ".join(f"{r['run_id']}={r['state']}({r['done']})" for r in rows), file=sys.stderr)
+            last = states
+        if args.dry_run or (rows and all(s in DONE for s in states)):
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            emit({"timed_out": True, "runs": rows} if args.json else rows, args)
+            sys.exit(3)
+        time.sleep(delay if deadline is None else max(0.0, min(delay, deadline - time.monotonic())))
+        delay = min(delay * 1.5, 300)
+    for r, e in zip(rows, entries):
+        bad = sorted(failed.get(e["job_id"], []))
+        if bad:
+            r["failed_tasks"] = bad
+            try:
+                r["failed_log_tail"] = log_tail(R, e, bad[0], args.lines)
+            except NuhpcError as ex:
+                r["failed_log_tail"] = f"(could not read the log: {ex})"
+    if args.json:
+        return emit({"timed_out": False, "runs": rows}, args)
+    emit([{k: v for k, v in r.items() if k != "failed_log_tail"} for r in rows], args)
+    for r in rows:
+        if r.get("failed_log_tail"):
+            print(f"\n== {r['run_id']}: log of task {r['failed_tasks'][0]} (first failed) ==\n{r['failed_log_tail']}", end="")
+
+
+def log_tail(R, e: dict, task: int, n: int, grep: str | None = None) -> str:
+    files = f"{shlex.quote(e['remote_dir'])}/logs/*" + (f"_{int(task)}.out" if e["n_tasks"] > 1 else ".out")
+    if grep:   # whole log searched, last n matches kept; the pattern is quoted for the remote shell
+        return R.run(f"grep -h -E -e {shlex.quote(grep)} {files} | tail -n {int(n)}")
+    return R.run(f"tail -n {int(n)} {files}")
 
 
 def cmd_logs(args, cfg, R):
     e = find_run(args.run)
-    suffix = f"_{args.task}.out" if e["n_tasks"] > 1 else ".out"
-    out = R.run(f"tail -n {int(args.lines)} {shlex.quote(e['remote_dir'])}/logs/*{suffix}")
+    out = log_tail(R, e, args.task, args.lines, args.grep)
     if args.json:
         emit({"run_id": e["run_id"], "task": args.task, "log": out}, args)
     else:
@@ -618,15 +721,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--grid", action="append", help="key=v1,v2,... cartesian product; repeatable")
     p.add_argument("--max-parallel", type=int, help="max array tasks running at once")
     p.add_argument("--confirm-big", action="store_true", help="bypass configured limits (human approval only)")
+    p.add_argument("--pack", action="store_true",
+                   help="one array task per group of rows sharing the template's pack-by keys "
+                        "(vllm_eval: one server per model, the client runs once per row)")
     add_resource_flags(p)
 
     p = sub("status", cmd_status, "state of runs (default: last 10)")
     p.add_argument("run", nargs="*")
     p.add_argument("--last", type=int, default=10)
+    p = sub("wait", cmd_wait, "block until runs finish (polls with backoff); prints final states and "
+                              "the log tail of the first failed task")
+    p.add_argument("run", nargs="+")
+    p.add_argument("--timeout", type=float, help="stop after this many seconds: exit 3, current states included")
+    p.add_argument("--interval", type=float, default=30, help="first poll interval in s; grows x1.5 up to 300")
+    p.add_argument("-n", "--lines", type=int, default=40, help="log lines shown for a failed task")
     p = sub("logs", cmd_logs, "tail a run's log (per array task)")
     p.add_argument("run")
     p.add_argument("--task", type=int, default=0)
     p.add_argument("-n", "--lines", type=int, default=80)
+    p.add_argument("--grep", help="only lines matching this extended regex, searched over the whole log "
+                                  "(e.g. '^\\[p|s/trial|Traceback|Error'); -n keeps the last matches")
     p = sub("fetch", cmd_fetch, "rsync a run's outputs/ and logs/ to local_results")
     p.add_argument("run")
     p.add_argument("--include", action="append", help="glob(s) to fetch only, e.g. '*.json'")

@@ -28,8 +28,12 @@ def image_url(ref: str) -> str:
 client = OpenAI(base_url=os.environ["OPENAI_BASE_URL"], api_key="EMPTY")
 rows = [json.loads(l) for l in prompts_path.read_text().splitlines() if l.strip()]
 t0 = time.time()
-with open(out / "completions.jsonl", "w") as f:
+path = out / "completions.jsonl"   # resumable: rows already written (by an interrupted run) are skipped
+done = {json.loads(l)["id"] for l in path.read_text().splitlines() if l.strip()} if path.exists() else set()
+with open(path, "a") as f:
     for ex in rows:
+        if ex["id"] in done:
+            continue
         content = [{"type": "image_url", "image_url": {"url": image_url(ex["image"])}},
                    {"type": "text", "text": ex["prompt"]}]
         r = client.chat.completions.create(

@@ -86,7 +86,8 @@ Use the `check` output to fix the partition names and GPU types in your profiles
 | `nuhpc templates` | list job templates and their parameters |
 | `nuhpc submit TEMPLATE [opts]` | render, upload code, `sbatch`; prints `run_id` and `job_id` |
 | `nuhpc status [RUN...]` | per-run state with a per-task breakdown (default: last 10 runs) |
-| `nuhpc logs RUN [--task i] [-n N]` | tail a task's log |
+| `nuhpc wait RUN... [--timeout S]` | block until the runs finish, polling with backoff and riding out network drops; prints final states and the log tail of the first failed task (exit 3 on timeout) |
+| `nuhpc logs RUN [--task i] [-n N] [--grep RE]` | tail a task's log, or only the lines matching RE across the whole log |
 | `nuhpc fetch RUN [--include '*.json'] [--max-size 500M]` | rsync `outputs/` and `logs/` to `local_results/<run_id>` |
 | `nuhpc cancel RUN [--task i]` | `scancel` a whole run or one array task |
 | `nuhpc runs` / `nuhpc queue` | local ledger / your jobs in `squeue` |
@@ -108,6 +109,8 @@ RUN can be a full `run_id`, a unique prefix, a Slurm job id, or `last`.
 --grid key=a,b,c      cartesian product, repeatable; combines with --sweep
 --max-parallel N      array throttle
 --profile NAME        resource preset; override with --partition --time --gpus --mem --cpus --nodes --gres
+--pack                one array task per group of rows sharing the template's `# pack-by:` keys
+                      (vllm_eval: one server per model; the client runs once per row)
 --confirm-big         bypass limits (humans only)
 ```
 
@@ -125,7 +128,7 @@ In a template, `{{CODE}} {{RUN_DIR}} {{DATA}} {{REMOTE_ROOT}} {{NODES}} {{GPUS_P
 
 Read parameters into variables first, as in `X="$(hpc_param key)"`. Under `set -e`, a missing parameter aborts the job only inside an assignment, not when the substitution is inline in a command.
 
-To add your own templates, drop `*.sbatch` files into `templates_dir`. Lines starting with `# doc:` show up in `nuhpc templates`, which is also how an agent learns what a template expects.
+To add your own templates, drop `*.sbatch` files into `templates_dir`. Lines starting with `# doc:` show up in `nuhpc templates`, which is also how an agent learns what a template expects. A template supports `--pack` by declaring `# pack-by: key ...` (the params that must be equal within one task) and running its per-row work through `hpc_each_row CMD`, which sets `HPC_ROW_PARAMS` and `HPC_ROW_OUT` for each row.
 
 ## Workflow: LLM/VLM experiments
 
@@ -151,7 +154,7 @@ For 70B-class models, use a multi-GPU profile (`--gpus 4`). vLLM picks the tenso
 
 Three practical points:
 
-- **Each task restarts vLLM**, which took 2–19 minutes on Explorer: fast on a node that has read the weights recently, slow on a cold one. So sweep *models* across array tasks, and loop over cheap settings like temperature or prompt variants inside one task's client.
+- **Each task restarts vLLM**, which took 2–19 minutes on Explorer: fast on a node that has read the weights recently, slow on a cold one. Pass `--pack` so the rows that share a model share one server: the client then runs once per row, writing to `outputs/task_K/row_R/`. Size `--time` for all rows of a pack.
 
 - Model size drives your queue time more than anything else: one H200 or A100-80GB job usually starts faster than a four-GPU job.
 - Keep `max_parallel` modest so you don't monopolise the shared GPU queue.
