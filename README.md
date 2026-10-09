@@ -6,7 +6,7 @@ It covers quick one-off tests, larger batch jobs that run models directly, and h
 
 ```
 laptop / agent ──nuhpc──► ssh+rsync ──► login.explorer.northeastern.edu ──sbatch──► GPU nodes
-                 ledger                    $remote_root/runs/<run_id>/{job.sbatch, sweep.jsonl, code/, outputs/, logs/}
+                 ledger                    $remote_root/runs/<run_id>/{job.sbatch, sweep.jsonl, code/, outputs/, logs/, usage/}
 ```
 
 ## Which mode?
@@ -134,7 +134,7 @@ The environment and the HF cache sit wherever your `env_setup` points; ours are 
 - `~/nuhpc-results/<run_id>/usage.json`: beside the results, once fetched (the CSVs come along in `usage/`).
 - `~/.nuhpc/usage/` in your cluster home: outside `remote_root`, so cleaning `runs/` keeps it, and shared by every machine that submits as you.
 
-`nuhpc usage [RUN...] [--since 7d|all] [--project P]` prints one row per finished run and totals per project; the first call also records any older run that lacks a record (the GPU columns stay empty for runs from before the sampler). `mem_%` is Slurm's peak memory over the request, and can pass 100 % without an out-of-memory kill: a model download on Explorer showed 168 %. Tag runs with `submit --project P` (or `run --project P`) to make the per-project totals mean something.
+`nuhpc usage [RUN...] [--since 7d|all] [--project P]` prints one row per finished run and totals per project; the first call also records any older run that lacks a record (the GPU columns stay empty for runs from before the sampler). `mem_%` is Slurm's peak memory over the request, and can pass 100 % without an out-of-memory kill: a model download on Explorer showed 168 %. Tag runs with `submit --project P` (or `run --project P`) to make the per-project totals mean something. If the cluster can't be reached when a run is first seen finished, the command warns `usage not recorded` and carries on; the next `wait`, `fetch` or `usage` records the run from Slurm's accounting, so nothing is lost.
 
 **Cleaning up.** Run folders stay in `runs/` until you delete them: a few KB of logs for a test, MB of outputs for an experiment. `fetch` what you keep, then delete old runs yourself:
 
@@ -283,7 +283,7 @@ Recipe, if you go ahead: install Node and Claude Code in `$HOME`, and write a `p
 
 ## Troubleshooting on Explorer
 
-Every row below happened while setting this up (2026-10-07/08).
+Every row below happened while setting this up (2026-10-07/09).
 
 | symptom | cause | fix |
 |---|---|---|
@@ -295,12 +295,13 @@ Every row below happened while setting this up (2026-10-07/08).
 | vLLM startup takes 2–19 min | weights (7 GB at ~30 MB/s on a cold node) and imports come over network storage | normal: use `--pack`, and give `--time` room |
 | `rsync: unexpected end of file`, `ssh … exit 255` | a dropped or throttled connection | repeatable calls retry automatically; if a submit failed before `sbatch`, just submit again |
 | `wait` prints transport errors, then carries on | laptop asleep, or network changed | normal: it gives up only after 10 failures in a row |
+| `nuhpc usage` shows `mem_%` above 100, with no out-of-memory kill | Slurm's peak-memory figure on Explorer can exceed the request (a model download showed 168 %) | nothing: it is Slurm's number, not a warning |
 | a job pending for a long time | see "Why a job is pending" | — |
 | `status` says `SUBMITTED` | `sacct` hasn't caught up yet | wait a few seconds |
 
 ## Design notes
 
-- **Verbs, not a shell.** An agent can only call `run / submit / wait / status / logs / fetch / cancel / push / pull / ls`. There is no `exec` on the login node, and remote paths are confined to `remote_root`; the one exception is the fixed `~/.nuhpc/usage/` folder that nuhpc itself writes usage records to. Code you upload does run on compute nodes; that is the point, and it stays inside Slurm's accounting.
+- **Verbs, not a shell.** An agent can only call `run / submit / wait / status / logs / fetch / usage / cancel / push / pull / ls`. There is no `exec` on the login node, and remote paths are confined to `remote_root`; the one exception is the fixed `~/.nuhpc/usage/` folder that nuhpc itself writes usage records to. Code you upload does run on compute nodes; that is the point, and it stays inside Slurm's accounting.
 - **Every job is a run.** Each run is a frozen snapshot of the rendered sbatch, the parameters, and the code. That makes runs reproducible and easy to inspect: everything lives in `runs/<run_id>/`.
 - **One contract for batch code.** Your script takes `--params <params.json> --out <dir>` and writes what it wants kept into `--out`. Sweeps, evals and training all use this shape. Quick tests (`run`/`cmd`) skip it.
 - **Sweeps are job arrays.** There is one task per row, or per pack, throttled with `%max_parallel`. This is how you run models or configurations in parallel without monopolising the GPU queue.

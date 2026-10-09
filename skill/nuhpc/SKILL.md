@@ -33,7 +33,7 @@ You reach the cluster only through `nuhpc`. Never call `ssh`, `scp`, `rsync` or 
 - vLLM startup takes 2–19 minutes, because weights and imports come over network storage. `vllm_eval` allows 45 minutes. Don't cancel a run that is still starting.
 - `cuda available: True` can still fail at the first real kernel when a wheel's CUDA is newer than the driver (570.86, CUDA ≤12.8). Trust the smoke template's `cuda kernel: ok` line instead.
 - Jobs inherit `http_proxy`, which is how compute nodes reach the internet. A server you start on the node must be reached with `no_proxy=127.0.0.1,localhost`; `vllm_eval` sets this.
-- The run ledger is local: runs submitted from another machine show in `queue`, but not in `status` or `wait`.
+- The run ledger is local: runs submitted from another machine show in `queue`, but not in `status`, `wait` or `usage`.
 
 ## Hard rules
 
