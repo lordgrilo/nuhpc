@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 import tomllib
-from datetime import datetime
+from datetime import datetime, timedelta
 from importlib import resources
 from pathlib import Path
 
@@ -35,6 +35,11 @@ RETRY_DELAYS = (5, 15)                            # seconds between attempts at 
 DEFAULT_EXCLUDES = [".git", "__pycache__", ".venv", "venv", "*.pyc", ".ipynb_checkpoints",
                     "wandb", "outputs", "data", "*.ckpt", "*.safetensors", "*.pt", "*.bin"]
 RES_KEYS = ("partition", "time", "cpus", "mem", "gres", "nodes", "account", "constraint")
+# Usage records: kept locally in STATE_DIR/usage/, beside the results, and on the cluster in $HOME (relative path),
+# outside remote_root so cleaning runs/ keeps them, and shared by every machine that submits as this user.
+REMOTE_USAGE = ".nuhpc/usage"
+USAGE_FIELDS = "JobID,State,ExitCode,Submit,Start,End,ElapsedRaw,TimelimitRaw,NodeList,AllocTRES,TotalCPU,MaxRSS,ReqMem"
+SECTION = "__nuhpc_usage_section__"
 
 
 class NuhpcError(Exception):
@@ -297,6 +302,13 @@ PY
 echo "[nuhpc] run=$HPC_RUN_ID task=$HPC_TASK_ID host=$(hostname) start=$(date -Is)"
 command -v nvidia-smi >/dev/null && nvidia-smi -L || true
 cat "$HPC_PARAMS"; echo
+# ---- usage: GPU samples every 30 s, summarised into usage.json once the run ends ----
+# No EXIT trap (templates own that); Slurm kills the sampler with the job. Multi-node: first node only.
+if [ -n "${{CUDA_VISIBLE_DEVICES:-}}" ] && command -v nvidia-smi >/dev/null; then
+  mkdir -p "$HPC_RUN_DIR/usage"
+  nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used --format=csv,noheader,nounits -l 30 \
+    > "$HPC_RUN_DIR/usage/task_${{HPC_TASK_ID}}_gpu.csv" 2>/dev/null &
+fi
 '''
 
 
@@ -391,6 +403,147 @@ def emit(data, args) -> None:
         print(data)
 
 
+# --------------------------------------------------------------------------- usage
+
+def clock_seconds(s: str) -> float:
+    """Slurm [D-][HH:]MM:SS[.mmm] (TotalCPU) in seconds."""
+    if not s:
+        return 0.0
+    days, s = s.split("-", 1) if "-" in s else ("0", s)
+    p = [float(x) for x in s.split(":")]
+    p = [0.0] * (3 - len(p)) + p
+    return int(days) * 86400 + p[0] * 3600 + p[1] * 60 + p[2]
+
+
+def size_gb(s: str) -> float | None:
+    """Slurm sizes (MaxRSS '16777216K', ReqMem '64G' or legacy '64Gn') in GB."""
+    m = re.match(r"([\d.]+)([KMGT]?)", s or "")
+    return float(m.group(1)) * 1024.0 ** ("KMGT".index(m.group(2)) - 2 if m.group(2) else -3) if m else None
+
+
+def ratio(a, b):
+    return round(a / b, 3) if a is not None and b else None
+
+
+def gpu_summary_cmd(entries: list[dict]) -> str:
+    """Remote shell: per task, the sample count, mean and max GPU utilisation (%) and max memory (MiB)."""
+    csvs = " ".join(f"{shlex.quote(e['remote_dir'])}/usage/task_*_gpu.csv" for e in entries)
+    awk = ("awk -F', *' -v f=\"$f\" '$3 ~ /^[0-9.]+$/ {n++; s+=$3; if ($3>u) u=$3; if ($4>m) m=$4} "
+           "END {if (n) printf \"%s|%d|%.1f|%d|%d\\n\", f, n, s/n, u, m}' \"$f\"")
+    return f'for f in {csvs}; do if [ -f "$f" ]; then {awk}; fi; done'
+
+
+def usage_query(entries: list[dict]) -> str:
+    """Remote shell, one call (each ssh is a fresh login): make the cluster-home copy dir, then print three
+    sections: accounting, the GPU type of each node used (Explorer's sacct doesn't name it), GPU samples."""
+    ids = ",".join(e["job_id"] for e in entries)
+    nodes = (r"""nodes=$(printf '%s\n' "$acct" | awk -F'|' '$1 !~ /[.]/ && $9 !~ /^None/ {print $9}' """
+             r"""| sort -u | paste -sd, -); [ -z "$nodes" ] || sinfo -h -N -n "$nodes" -o '%N|%G' || true""")
+    return (f"mkdir -p ~/{REMOTE_USAGE}; acct=$(sacct -n -P --format={USAGE_FIELDS} -j {ids}) || exit 1; "
+            f"printf '%s\\n' \"$acct\"; echo {SECTION}; {nodes}; echo {SECTION}; " + gpu_summary_cmd(entries))
+
+
+def parse_usage(out: str, entries: list[dict]) -> dict[str, dict]:
+    """Usage records of the runs whose tasks have all ended (until then the numbers still change)."""
+    acct, node_gres, samples = (out.split(SECTION) + ["", ""])[:3]
+    alloc: dict[tuple, list[str]] = {}
+    steps: dict[tuple, list[list[str]]] = {}
+    for line in acct.splitlines():
+        p = line.split("|")
+        if len(p) != 13:
+            continue
+        jid, _, step = p[0].partition(".")
+        base, _, idx = jid.partition("_")
+        if idx.startswith("["):        # array tasks that haven't started
+            continue
+        key = (base, int(idx or 0))
+        if step:
+            steps.setdefault(key, []).append(p)
+        else:
+            alloc[key] = p
+    node_gpu = {}
+    for line in node_gres.splitlines():   # 'd1026|gpu:a100:3(S:0-1)'
+        node, _, gres = line.partition("|")
+        if m := re.search(r"gpu:([\w.-]+):\d", gres):
+            node_gpu[node] = m.group(1)
+    gpu = {}
+    for line in samples.splitlines():
+        m = re.match(r"(.*)/usage/task_(\d+)_gpu\.csv\|(\d+)\|([\d.]+)\|(\d+)\|(\d+)$", line)
+        if m:
+            gpu[(m.group(1), int(m.group(2)))] = m.groups()[2:]
+    recs = {}
+    for e in entries:
+        keys = sorted(k for k in alloc if k[0] == e["job_id"])
+        if len(keys) < e["n_tasks"] or any(alloc[k][1].split()[0] not in TERMINAL for k in keys):
+            continue
+        tasks = []
+        for k in keys:
+            p, st = alloc[k], steps.get(k, [])
+            tres = dict(kv.split("=", 1) for kv in p[9].split(",") if "=" in kv)
+            gpus, cpus, elapsed = int(tres.get("gres/gpu", 0)), int(tres.get("cpu", 0)), int(p[6] or 0)
+            limit = int(p[7]) * 60 if p[7].isdigit() else None
+            try:
+                wait = int((datetime.fromisoformat(p[4]) - datetime.fromisoformat(p[3])).total_seconds())
+            except ValueError:         # never started: Start is "None" or "Unknown"
+                wait = None
+            rss = max((size_gb(s[11]) or 0 for s in st), default=None)
+            g = gpu.get((e["remote_dir"], k[1]))
+            tasks.append({
+                "task": k[1], "state": p[1].split()[0], "exit_code": p[2], "node": p[8],
+                "gpu_type": next((t.split(":", 1)[1] for t in tres if t.startswith("gres/gpu:")),
+                                 node_gpu.get(p[8]) if gpus else None),
+                "gpus": gpus, "cpus": cpus, "submit": p[3], "start": p[4], "end": p[5],
+                "queue_wait_s": wait, "elapsed_s": elapsed, "time_limit_s": limit,
+                "gpu_hours": round(gpus * elapsed / 3600, 3), "cpu_hours": round(cpus * elapsed / 3600, 3),
+                "cpu_eff": ratio(max(clock_seconds(p[10]), sum(clock_seconds(s[10]) for s in st)), cpus * elapsed),
+                "max_rss_gb": round(rss, 2) if rss is not None else None, "mem_eff": ratio(rss, size_gb(p[12])),
+                "time_eff": ratio(elapsed, limit),
+                "gpu_samples": int(g[0]) if g else None, "gpu_util_mean": float(g[1]) if g else None,
+                "gpu_util_max": int(g[2]) if g else None,
+                "gpu_mem_max_gb": round(int(g[3]) / 1024, 2) if g else None})
+        stage = STATE_DIR / "runs" / e["run_id"] / "meta.json"
+        requested = json.loads(stage.read_text())["resources"] if stage.exists() else {}
+        states: dict[str, int] = {}
+        for t in tasks:
+            states[t["state"]] = states.get(t["state"], 0) + 1
+        waits = [t["queue_wait_s"] for t in tasks if t["queue_wait_s"] is not None]
+        recs[e["run_id"]] = {
+            "run_id": e["run_id"], "job_id": e["job_id"], "project": e.get("project"), "template": e["template"],
+            "profile": e["profile"], "created": e["created"], "recorded": datetime.now().isoformat(timespec="seconds"),
+            "requested": {**requested, "n_tasks": e["n_tasks"], "worst_case_gpu_hours": e["worst_case_gpu_hours"]},
+            "tasks": tasks,
+            "totals": {"gpu_hours": round(sum(t["gpus"] * t["elapsed_s"] for t in tasks) / 3600, 3),
+                       "cpu_hours": round(sum(t["cpus"] * t["elapsed_s"] for t in tasks) / 3600, 3),
+                       "worst_case_gpu_hours": e["worst_case_gpu_hours"],
+                       "queue_wait_s_max": max(waits, default=None), "states": states}}
+    return recs
+
+
+def ensure_usage(cfg: dict, R, entries: list[dict]) -> dict[str, dict]:
+    """Usage records for these runs. Saved ones are read back; finished runs without one are recorded now
+    and the local records copied to the cluster home. Fails soft: a transport error only warns."""
+    d = STATE_DIR / "usage"
+    recs = {e["run_id"]: json.loads((d / f"{e['run_id']}.json").read_text())
+            for e in entries if (d / f"{e['run_id']}.json").exists()}
+    todo = [e for e in entries if e["run_id"] not in recs]
+    if todo and not R.dry:
+        try:
+            new = parse_usage(R.run(usage_query(todo)), todo)
+            if new:
+                d.mkdir(parents=True, exist_ok=True)
+                for r in new.values():
+                    (d / f"{r['run_id']}.json").write_text(json.dumps(r, indent=2))
+                recs.update(new)
+                R.rsync(f"{d}/", f"{cfg['ssh_host']}:{REMOTE_USAGE}/")   # whole dir: retries any failed copy
+        except NuhpcError as ex:
+            print(f"[nuhpc] usage not recorded: {str(ex).splitlines()[0]}", file=sys.stderr)
+    for r in recs.values():           # beside the results, once fetched
+        res = Path(cfg["local_results"]).expanduser() / r["run_id"]
+        if res.is_dir():
+            (res / "usage.json").write_text(json.dumps(r, indent=2))
+    return recs
+
+
 # --------------------------------------------------------------------------- commands
 
 EXAMPLE_CONFIG = (Path(__file__).parent / "example_config.toml")
@@ -476,7 +629,8 @@ def cmd_submit(args, cfg, R, quiet=False, tasks=None):
     (stage / "sweep.jsonl").write_text("".join(json.dumps(t) + "\n" for t in tasks))
     if packs:
         (stage / "packs.json").write_text(json.dumps(packs))
-    meta = {"run_id": run_id, "template": template.stem, "profile": prof, "resources": res, "n_tasks": n,
+    meta = {"run_id": run_id, "template": template.stem, "project": getattr(args, "project", None),
+            "profile": prof, "resources": res, "n_tasks": n,
             "n_rows": len(tasks), "pack_by": keys or None,
             "max_parallel": max_par, "worst_case_gpu_hours": round(gpu_h, 2), "code": args.code,
             "created": datetime.now().isoformat(timespec="seconds")}
@@ -487,7 +641,8 @@ def cmd_submit(args, cfg, R, quiet=False, tasks=None):
         code = Path(args.code).expanduser().resolve()
         if not code.is_dir():
             raise NuhpcError(f"--code must be a directory: {code}")
-    R.run(f"mkdir -p {shlex.quote(run_dir)}/logs {shlex.quote(run_dir)}/outputs {shlex.quote(run_dir)}/code")
+    R.run(f"mkdir -p {shlex.quote(run_dir)}/logs {shlex.quote(run_dir)}/outputs {shlex.quote(run_dir)}/code "
+          f"{shlex.quote(run_dir)}/usage")
     R.rsync(f"{stage}/", f"{host}:{run_dir}/")
     if args.code:
         ex = [f"--exclude={e}" for e in DEFAULT_EXCLUDES]
@@ -498,7 +653,7 @@ def cmd_submit(args, cfg, R, quiet=False, tasks=None):
     job_id = out.strip().split(";")[0] if out.strip() else "DRY-RUN"
     result = {**meta, "job_id": job_id, "remote_dir": run_dir, "local_stage": str(stage)}
     if not args.dry_run:
-        ledger_append({k: result[k] for k in ("run_id", "job_id", "template", "profile", "n_tasks",
+        ledger_append({k: result[k] for k in ("run_id", "job_id", "template", "project", "profile", "n_tasks",
                                              "remote_dir", "created", "worst_case_gpu_hours")})
     if quiet:
         return {"run_id": run_id, "job_id": job_id, "local_stage": str(stage)}
@@ -581,6 +736,7 @@ def cmd_wait(args, cfg, R):
     if timed_out:
         emit({"timed_out": True, "runs": rows} if args.json else rows, args)
         sys.exit(3)
+    ensure_usage(cfg, R, entries)
     for r, e in zip(rows, entries):
         bad = sorted(failed.get(e["job_id"], []))
         if bad:
@@ -618,6 +774,7 @@ def cmd_run(args, cfg, R):
         sys.exit(3)
     log = log_tail(R, e, 0, args.lines)
     dest, _ = fetch_run(cfg, R, e)
+    ensure_usage(cfg, R, [e])
     if args.json:
         emit({"run_id": e["run_id"], "job_id": e["job_id"], "state": state, "log": log, "local": str(dest)}, args)
     else:
@@ -646,21 +803,23 @@ def cmd_logs(args, cfg, R):
 def fetch_run(cfg, R, e: dict, include=None, max_size=None) -> tuple[Path, str | None]:
     dest = Path(cfg["local_results"]).expanduser() / e["run_id"]
     dest.mkdir(parents=True, exist_ok=True)
-    extra = []
     max_size = max_size or cfg["limits"].get("fetch_max_file_size")
-    if max_size:
-        extra.append(f"--max-size={max_size}")
-    if include:
-        extra += ["-m", "--include=*/", *[f"--include={p}" for p in include], "--exclude=*"]
+    size = [f"--max-size={max_size}"] if max_size else []
+    extra = size + (["-m", "--include=*/", *[f"--include={p}" for p in include], "--exclude=*"] if include else [])
     for sub in ("outputs", "logs"):
         R.rsync(f"{cfg['ssh_host']}:{e['remote_dir']}/{sub}/", f"{dest}/{sub}/", extra)
     R.rsync(f"{cfg['ssh_host']}:{e['remote_dir']}/meta.json", f"{dest}/meta.json")
+    try:   # GPU samples always come along; runs from before usage accounting have no usage/ dir
+        R.rsync(f"{cfg['ssh_host']}:{e['remote_dir']}/usage/", f"{dest}/usage/", size)
+    except NuhpcError:
+        pass
     return dest, max_size
 
 
 def cmd_fetch(args, cfg, R):
     e = find_run(args.run)
     dest, max_size = fetch_run(cfg, R, e, args.include, args.max_size)
+    ensure_usage(cfg, R, [e])
     emit({"run_id": e["run_id"], "local": str(dest), "max_file_size": max_size or "none"}, args)
 
 
@@ -672,9 +831,59 @@ def cmd_cancel(args, cfg, R):
 
 
 def cmd_runs(args, cfg, R):
-    rows = [{k: e[k] for k in ("run_id", "job_id", "template", "profile", "n_tasks", "created")}
-            for e in ledger_read()[-args.last:]]
+    rows = [{**{k: e[k] for k in ("run_id", "job_id", "template")}, "project": e.get("project") or "-",
+             **{k: e[k] for k in ("profile", "n_tasks", "created")}} for e in ledger_read()[-args.last:]]
     emit(rows, args)
+
+
+def cmd_usage(args, cfg, R):
+    if args.run:
+        entries = [find_run(r) for r in args.run]
+    else:
+        entries = ledger_read()
+        if args.since != "all":
+            m = re.fullmatch(r"(\d+)([hd])", args.since)
+            if not m:
+                raise NuhpcError("--since takes a duration such as 48h or 7d, or 'all'")
+            cutoff = datetime.now() - timedelta(hours=int(m.group(1)) * (24 if m.group(2) == "d" else 1))
+            entries = [e for e in entries if datetime.fromisoformat(e["created"]) >= cutoff]
+    if args.project:
+        entries = [e for e in entries if e.get("project") == args.project]
+    recs = ensure_usage(cfg, R, entries)
+    rows, totals = [], {}
+    for e in entries:
+        u = recs.get(e["run_id"])
+        if not u:
+            continue
+        t, tot = u["tasks"], u["totals"]
+        util = [x["gpu_util_mean"] for x in t if x["gpu_util_mean"] is not None]
+        mem = [x["mem_eff"] for x in t if x["mem_eff"] is not None]
+        time_eff = ratio(sum(x["elapsed_s"] for x in t), sum(x["time_limit_s"] or 0 for x in t))
+        row = {"run_id": u["run_id"], "project": u["project"] or "-",
+               "gpu": next((f"{x['gpus']}x{x['gpu_type'] or 'gpu'}" for x in t if x["gpus"]), "-"),
+               "states": ",".join(f"{k}={v}" for k, v in tot["states"].items()),
+               "wait_min": round(tot["queue_wait_s_max"] / 60, 1) if tot["queue_wait_s_max"] is not None else "-",
+               "gpu_h": tot["gpu_hours"], "req_gpu_h": tot["worst_case_gpu_hours"], "cpu_h": tot["cpu_hours"],
+               "time_%": round(100 * time_eff) if time_eff is not None else "-",
+               "gpu_util_%": round(sum(util) / len(util)) if util else "-",
+               "mem_%": round(100 * max(mem)) if mem else "-"}
+        rows.append(row)
+        for key in (row["project"], "all"):
+            g = totals.setdefault(key, {"project": key, "runs": 0, "gpu_h": 0.0, "req_gpu_h": 0.0, "cpu_h": 0.0})
+            g["runs"] += 1
+            for f in ("gpu_h", "req_gpu_h", "cpu_h"):
+                g[f] = round(g[f] + row[f], 2)
+    totals = sorted(totals.values(), key=lambda g: g["project"] == "all")
+    unfinished = [e["run_id"] for e in entries if e["run_id"] not in recs]
+    if args.json:
+        return emit({"runs": rows, "totals": totals, "unfinished": unfinished,
+                     "records": str(STATE_DIR / "usage")}, args)
+    emit(rows, args)
+    if rows:
+        print()
+        emit(totals, args)
+    if unfinished:
+        print(f"[nuhpc] {len(unfinished)} run(s) not finished yet, not counted", file=sys.stderr)
 
 
 def cmd_queue(args, cfg, R):
@@ -769,6 +978,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub("submit", cmd_submit, "render a template into a run, upload code, sbatch it")
     p.add_argument("template")
     p.add_argument("--name")
+    p.add_argument("--project", help="tag for usage accounting (e.g. miller, runes); see `nuhpc usage`")
     p.add_argument("--code", help="local project dir to snapshot into the run (respects .nuhpcignore)")
     p.add_argument("-p", "--param", action="append", help="key=value (value parsed as JSON if possible); repeatable")
     p.add_argument("--sweep", help=".jsonl/.json/.csv: one task (array element) per row")
@@ -783,6 +993,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub("run", cmd_run, "quick test: run COMMAND on a compute node (30 min unless --time), wait, "
                             "print its output, fetch $HPC_OUT")
     p.add_argument("--name")
+    p.add_argument("--project", help="tag for usage accounting; see `nuhpc usage`")
     p.add_argument("--code", help="local project dir to snapshot; COMMAND runs inside it")
     p.add_argument("--timeout", type=float, help="stop waiting after this many seconds: exit 3, the job keeps going")
     p.add_argument("--interval", type=float, default=15, help="first poll interval in s")
@@ -814,6 +1025,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--task", type=int)
     p = sub("runs", cmd_runs, "list runs submitted from this machine")
     p.add_argument("--last", type=int, default=20)
+    p = sub("usage", cmd_usage, "compute used vs requested per finished run, with totals per project "
+                                "(records each run once, locally and in the cluster home)")
+    p.add_argument("run", nargs="*")
+    p.add_argument("--since", default="7d", help="runs submitted within e.g. 48h or 7d (default), or 'all'")
+    p.add_argument("--project", help="only runs tagged with this project")
     sub("queue", cmd_queue, "your jobs in the Slurm queue")
     p = sub("push", cmd_push, "upload data to remote_root/data/")
     p.add_argument("local")

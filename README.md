@@ -87,10 +87,11 @@ nuhpc wait last && nuhpc logs last                            # read the smoke r
 ```bash
 nuhpc queue                                    # my jobs in Slurm, with the reason a job is still pending
 nuhpc run --code . --profile a100x1 --partition gpu-short -- python probe.py    # quick test, blocks, prints output
-nuhpc submit python --code . --sweep rows.jsonl --profile a100x1 --time 02:00:00   # batch job (one task per row)
+nuhpc submit python --code . --sweep rows.jsonl --profile a100x1 --time 02:00:00 --project miller   # batch job, one task per row
 nuhpc wait RUN                                 # block until done; survives laptop sleep; shows failed logs
 nuhpc logs RUN --task 3 --grep 'Traceback|Error|s/trial'                      # progress or errors only
 nuhpc fetch RUN --include '*.json' --include '*.jsonl'                        # results to ~/nuhpc-results/RUN
+nuhpc usage --since 7d                         # compute used vs requested per run, totals per project
 nuhpc push ./stimuli stimuli                   # inputs to $remote_root/data/stimuli
 nuhpc cancel RUN                               # scancel
 ```
@@ -99,10 +100,10 @@ RUN can be a full `run_id`, a unique prefix, a Slurm job id, or `last`.
 
 **Where things live.** On the cluster, under `remote_root`:
 
-- `runs/<run_id>/`: `job.sbatch`, `sweep.jsonl`, `packs.json`, `code/` (the snapshot), `outputs/task_K/` (`row_R/` when packed), and `logs/`.
+- `runs/<run_id>/`: `job.sbatch`, `sweep.jsonl`, `packs.json`, `code/` (the snapshot), `outputs/task_K/` (`row_R/` when packed), `logs/`, and `usage/` (GPU samples).
 - `data/`: whatever you `push`.
 
-The environment and the HF cache sit wherever your `env_setup` points; ours are `envs/llm` and `hf_cache`. Locally: the config is `~/.config/nuhpc/config.toml`, the ledger and staged jobs are in `~/.local/share/nuhpc/`, and fetched results go to `~/nuhpc-results/<run_id>/`.
+The environment and the HF cache sit wherever your `env_setup` points; ours are `envs/llm` and `hf_cache`. Locally: the config is `~/.config/nuhpc/config.toml`, the ledger, staged jobs and usage records are in `~/.local/share/nuhpc/`, and fetched results go to `~/nuhpc-results/<run_id>/`. Usage records are also copied to `~/.nuhpc/usage/` in your cluster home (see Usage).
 
 **Partitions seen on 2026-10-07.**
 
@@ -127,13 +128,21 @@ The environment and the HF cache sit wherever your `env_setup` points; ours are 
 
 **Costs.** Every submit reports `worst_case_gpu_hours` (GPUs × nodes × walltime × tasks). Anything above the limits in your config needs `--confirm-big`. Keep `--time` near the real runtime: shorter jobs schedule sooner.
 
+**Usage.** Each run gets a usage record, `<run_id>.json`, the first time `wait`, `run`, `fetch` or `usage` sees it finished. It holds what was requested (from `meta.json`) next to what Slurm accounted, per task: state and exit code, node, the GPU type of that node (Explorer's accounting counts GPUs without naming them, so the type comes from `sinfo`), queue wait, elapsed time, GPU-hours and CPU-hours (allocated × elapsed), CPU and memory efficiency, and time used as a share of `--time`. GPU jobs also sample `nvidia-smi` every 30 s into `runs/<run_id>/usage/task_K_gpu.csv`, which adds mean and peak GPU utilisation and peak GPU memory (first node only on multi-node runs). A record is written once, since Slurm's accounting of a finished job never changes, and kept in three places:
+
+- `~/.local/share/nuhpc/usage/`: every run submitted from this machine; what `nuhpc usage` reads.
+- `~/nuhpc-results/<run_id>/usage.json`: beside the results, once fetched (the CSVs come along in `usage/`).
+- `~/.nuhpc/usage/` in your cluster home: outside `remote_root`, so cleaning `runs/` keeps it, and shared by every machine that submits as you.
+
+`nuhpc usage [RUN...] [--since 7d|all] [--project P]` prints one row per finished run and totals per project; the first call also records any older run that lacks a record (the GPU columns stay empty for runs from before the sampler). `mem_%` is Slurm's peak memory over the request, and can pass 100 % without an out-of-memory kill: a model download on Explorer showed 168 %. Tag runs with `submit --project P` (or `run --project P`) to make the per-project totals mean something.
+
 **Cleaning up.** Run folders stay in `runs/` until you delete them: a few KB of logs for a test, MB of outputs for an experiment. `fetch` what you keep, then delete old runs yourself:
 
 ```bash
 ssh YOUR_NU_USERNAME@login.explorer.northeastern.edu 'cd <remote_root>/runs && rm -rf -- <run_id> <run_id>'
 ```
 
-There is deliberately no `nuhpc` delete command, so an agent allowed to run `nuhpc` cannot destroy results. Deleting a run folder leaves alone its ledger entry (history), its fetched copy in `~/nuhpc-results/`, and any weights it cached in `HF_HOME`; `logs` and `fetch` on that run fail afterwards. The local staging copies in `~/.local/share/nuhpc/runs/` can go at any time. To delete something with thousands of files, such as an old Python environment, do it inside a job with parallel deletes (`find DIR -type f -print0 | xargs -0 -P 16 rm -f`): file operations on `/projects` cost about 0.1 s each.
+There is deliberately no `nuhpc` delete command, so an agent allowed to run `nuhpc` cannot destroy results. Deleting a run folder leaves alone its ledger entry (history), its usage records, its fetched copy in `~/nuhpc-results/`, and any weights it cached in `HF_HOME`; `logs` and `fetch` on that run fail afterwards. The local staging copies in `~/.local/share/nuhpc/runs/` can go at any time. To delete something with thousands of files, such as an old Python environment, do it inside a job with parallel deletes (`find DIR -type f -print0 | xargs -0 -P 16 rm -f`): file operations on `/projects` cost about 0.1 s each.
 
 ## Workflows
 
@@ -194,7 +203,8 @@ Model size drives queue time more than anything else: one A100-80GB or H200 job 
 | `nuhpc status [RUN...]` | per-run state with a per-task breakdown (default: last 10 runs) |
 | `nuhpc wait RUN... [--timeout S]` | block until the runs finish, polling with backoff and riding out network drops; prints final states and the log tail of the first failed task (exit 3 on timeout) |
 | `nuhpc logs RUN [--task i] [-n N] [--grep RE]` | tail a task's log, or only the lines matching RE across the whole log |
-| `nuhpc fetch RUN [--include '*.json'] [--max-size 500M]` | rsync `outputs/` and `logs/` to `local_results/<run_id>` |
+| `nuhpc fetch RUN [--include '*.json'] [--max-size 500M]` | rsync `outputs/` and `logs/` (and the GPU samples in `usage/`) to `local_results/<run_id>` |
+| `nuhpc usage [RUN...] [--since 7d\|all] [--project P]` | compute used vs requested per finished run, totals per project (see Usage) |
 | `nuhpc cancel RUN [--task i]` | `scancel` a whole run or one array task |
 | `nuhpc runs` / `nuhpc queue` | local ledger / your jobs in `squeue` |
 | `nuhpc push LOCAL [REL] [--globus]` | upload data to `remote_root/data/REL` |
@@ -214,6 +224,7 @@ Global flags: `--json` gives machine-readable output, including errors as `{"err
 --pack                one array task per group of rows sharing the template's `# pack-by:` keys
                       (vllm_eval: one server per model; the client runs once per row)
 --max-parallel N      array throttle
+--project NAME        tag for usage accounting (nuhpc usage --project NAME)
 --profile NAME        resource preset; override with --partition --time --gpus --mem --cpus --nodes --gres
 --confirm-big         bypass limits (humans only)
 ```
@@ -289,7 +300,7 @@ Every row below happened while setting this up (2026-10-07/08).
 
 ## Design notes
 
-- **Verbs, not a shell.** An agent can only call `run / submit / wait / status / logs / fetch / cancel / push / pull / ls`. There is no `exec` on the login node, and remote paths are confined to `remote_root`. Code you upload does run on compute nodes; that is the point, and it stays inside Slurm's accounting.
+- **Verbs, not a shell.** An agent can only call `run / submit / wait / status / logs / fetch / cancel / push / pull / ls`. There is no `exec` on the login node, and remote paths are confined to `remote_root`; the one exception is the fixed `~/.nuhpc/usage/` folder that nuhpc itself writes usage records to. Code you upload does run on compute nodes; that is the point, and it stays inside Slurm's accounting.
 - **Every job is a run.** Each run is a frozen snapshot of the rendered sbatch, the parameters, and the code. That makes runs reproducible and easy to inspect: everything lives in `runs/<run_id>/`.
 - **One contract for batch code.** Your script takes `--params <params.json> --out <dir>` and writes what it wants kept into `--out`. Sweeps, evals and training all use this shape. Quick tests (`run`/`cmd`) skip it.
 - **Sweeps are job arrays.** There is one task per row, or per pack, throttled with `%max_parallel`. This is how you run models or configurations in parallel without monopolising the GPU queue.
@@ -300,5 +311,5 @@ Every row below happened while setting this up (2026-10-07/08).
 - Partition names, GPU type strings, time limits and `module` names are what one account saw on 2026-10-07. Confirm yours with `nuhpc check` and `module avail`.
 - `/scratch/$USER` can exist but be root-owned and unwritable. Check before pointing `HF_HOME` or `remote_root` at it. Check RC's scratch purge policy before relying on scratch at all.
 - Globus support is a thin wrapper over the `globus` CLI. It needs `globus login` once plus both endpoint UUIDs in the config.
-- The ledger is local to each machine. Runs submitted from another laptop are visible in `queue`, but not in `runs`, `status` or `wait`.
+- The ledger is local to each machine. Runs submitted from another laptop are visible in `queue`, but not in `runs`, `status`, `wait` or `usage`. Their usage records do reach `~/.nuhpc/usage/` on the cluster, which `nuhpc usage` doesn't read yet.
 - `pull` of a directory nests it one level deeper (`pulled/x/x`), because of rsync's trailing-slash rule.

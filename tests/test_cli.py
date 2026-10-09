@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -243,3 +244,130 @@ def test_missing_required_param_aborts_job(tmp_path, env):
     assert rc == 0
     _, p = run_job(tmp_path, env, res, {"python": "exit 0"})
     assert p.returncode != 0 and "missing required param 'entry'" in p.stderr
+
+
+# ---- usage accounting: requested vs used, recorded once a run ends ----
+
+SACCT_USAGE = "\n".join([
+    "100_0|COMPLETED|0:0|2026-01-01T10:00:00|2026-01-01T10:05:00|2026-01-01T10:35:00|1800|120|d1001|"
+    "billing=8,cpu=8,gres/gpu:a100=1,gres/gpu=1,mem=64G,node=1|02:00:00|0|64G",
+    "100_0.batch|COMPLETED|0:0|2026-01-01T10:05:00|2026-01-01T10:05:00|2026-01-01T10:35:00|1800||d1001|"
+    "cpu=8,gres/gpu:a100=1,gres/gpu=1,mem=64G,node=1|02:00:00|16777216K|",
+    # Explorer's form: an untyped gres/gpu count, so the type comes from the node (sinfo)
+    "100_1|OUT_OF_MEMORY|0:125|2026-01-01T10:00:00|2026-01-01T10:05:00|2026-01-01T10:15:00|600|120|d1002|"
+    "billing=112,cpu=8,gres/gpu=1,mem=64G,node=1|00:05:00|0|64G",
+    "100_1.batch|OUT_OF_MEMORY|0:125|2026-01-01T10:05:00|2026-01-01T10:05:00|2026-01-01T10:15:00|600||d1002|"
+    "cpu=8,gres/gpu=1,mem=64G,node=1|00:05:00|64G|",
+    "100_2|CANCELLED by 42|0:0|2026-01-01T10:00:00|None|2026-01-01T11:00:00|0|120|None assigned||00:00:00||64G",
+]) + "\n"
+NODE_GRES = "d1001|gpu:a100:3\nd1002|gpu:h200:8(S:0-1)\n"
+GPU_SUMMARY = "/r/runs/r1-20260101-000000/usage/task_0_gpu.csv|60|63.5|100|31744\n"
+USAGE_REPLY = SACCT_USAGE + f"{cli.SECTION}\n" + NODE_GRES + f"{cli.SECTION}\n" + GPU_SUMMARY
+
+
+def usage_transport(monkeypatch, reply):
+    calls, syncs = [], []
+
+    def fake_run(self, cmd, retry=True):
+        calls.append(cmd)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+    monkeypatch.setattr(cli.Remote, "run", fake_run)
+    monkeypatch.setattr(cli.Remote, "rsync", lambda self, src, dst, extra=None: syncs.append((src, dst)))
+    return calls, syncs
+
+
+def test_finished_run_gets_one_usage_record_in_three_places(inproc, monkeypatch, tmp_path, capsys):
+    calls, syncs = usage_transport(monkeypatch, USAGE_REPLY)
+    (tmp_path / "results/r1-20260101-000000").mkdir(parents=True)          # already fetched
+    cli.main(["--json", "usage", "r1"])
+    rec = json.loads((tmp_path / "state/usage/r1-20260101-000000.json").read_text())
+    t0, t1, t2 = rec["tasks"]
+    assert t0["gpu_type"] == "a100" and t0["queue_wait_s"] == 300 and t0["gpu_hours"] == 0.5
+    assert t0["cpu_eff"] == 0.5 and t0["max_rss_gb"] == 16 and t0["mem_eff"] == 0.25 and t0["time_eff"] == 0.25
+    assert t0["gpu_util_mean"] == 63.5 and t0["gpu_util_max"] == 100 and t0["gpu_mem_max_gb"] == 31.0
+    assert t1["state"] == "OUT_OF_MEMORY" and t1["mem_eff"] == 1.0 and t1["gpu_util_mean"] is None
+    assert t1["gpu_type"] == "h200"
+    assert t2["state"] == "CANCELLED" and t2["queue_wait_s"] is None and t2["gpu_hours"] == 0 and t2["gpu_type"] is None
+    assert rec["totals"]["gpu_hours"] == round(0.5 + 600 / 3600, 3)
+    assert rec["totals"]["states"] == {"COMPLETED": 1, "OUT_OF_MEMORY": 1, "CANCELLED": 1}
+    assert json.loads((tmp_path / "results/r1-20260101-000000/usage.json").read_text()) == rec
+    assert syncs == [(f"{tmp_path}/state/usage/", "nowhere:.nuhpc/usage/")]   # the cluster-home copy
+    out = json.loads(capsys.readouterr().out)
+    assert out["runs"][0]["gpu_h"] == rec["totals"]["gpu_hours"] and out["totals"][-1]["project"] == "all"
+    cli.main(["--json", "usage", "r1"])                    # a recorded run is read back, not queried again
+    assert len(calls) == 1
+
+
+def test_unfinished_run_is_not_recorded(inproc, monkeypatch, tmp_path, capsys):
+    usage_transport(monkeypatch, USAGE_REPLY.replace("100_2|CANCELLED by 42", "100_2|RUNNING"))
+    cli.main(["--json", "usage", "r1"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["runs"] == [] and out["unfinished"] == ["r1-20260101-000000"]
+    assert not (tmp_path / "state/usage/r1-20260101-000000.json").exists()
+
+
+def test_usage_recording_fails_soft(inproc, monkeypatch, capsys):
+    usage_transport(monkeypatch, cli.NuhpcError("ssh: connect to host: Operation timed out"))
+    cli.main(["--json", "usage", "r1"])
+    cap = capsys.readouterr()
+    assert json.loads(cap.out)["unfinished"] == ["r1-20260101-000000"] and "usage not recorded" in cap.err
+
+
+def test_usage_query_is_one_remote_shell(tmp_path, monkeypatch):
+    """The whole remote side, run locally against stub sacct/sinfo, then parsed."""
+    monkeypatch.setattr(cli, "STATE_DIR", tmp_path / "state")
+    run = tmp_path / "runs/r1-20260101-000000"
+    (run / "usage").mkdir(parents=True)
+    (run / "usage/task_0_gpu.csv").write_text("2026/01/01 10:00:00.000, 0, 20, 1000\n"
+                                              "2026/01/01 10:00:00.000, 1, [N/A], 9\n"
+                                              "2026/01/01 10:00:30.000, 0, 80, 3000\n")
+    (tmp_path / "acct").write_text(SACCT_USAGE)
+    e = {"run_id": run.name, "job_id": "100", "remote_dir": str(run), "n_tasks": 3, "template": "python",
+         "profile": None, "created": "x", "worst_case_gpu_hours": 1}
+    gone = {**e, "run_id": "gone", "job_id": "101", "remote_dir": str(tmp_path / "deleted-run")}
+    sinfo = f'echo "$*" > {tmp_path}/sinfo_args; printf "{NODE_GRES}"'
+    env = {**os.environ, "HOME": str(tmp_path / "home"),
+           "PATH": f"{stub_bin(tmp_path, sacct=f'cat {tmp_path}/acct', sinfo=sinfo)}:{os.environ['PATH']}"}
+    p = subprocess.run(["bash", "-c", cli.usage_query([e, gone])], capture_output=True, text=True, env=env)
+    assert p.returncode == 0, p.stderr
+    assert (tmp_path / "home/.nuhpc/usage").is_dir()
+    assert "-n d1001,d1002 " in (tmp_path / "sinfo_args").read_text()     # only the nodes these runs used
+    t = cli.parse_usage(p.stdout, [e, gone])[run.name]["tasks"]
+    assert [x["gpu_type"] for x in t] == ["a100", "h200", None]
+    assert (t[0]["gpu_samples"], t[0]["gpu_util_mean"], t[0]["gpu_util_max"]) == (2, 50.0, 80)
+    stub_bin(tmp_path, sacct="exit 1")                                    # accounting down: fail, don't guess
+    assert subprocess.run(["bash", "-c", cli.usage_query([e])], capture_output=True, env=env).returncode == 1
+
+
+def test_gpu_jobs_sample_utilisation_into_usage_dir(tmp_path, env):
+    rc, res = nuhpc(env, "submit", "cmd", "--partition", "gpu", "--gres", "gpu:1", "-p", "cmd=true")
+    assert rc == 0
+    smi = 'if [ "$1" = -L ]; then echo "GPU 0: A100"; else echo "2026/01/01 10:00:00.000, 0, 42, 1234"; fi'
+    run_dir, p = run_job(tmp_path, {**env, "CUDA_VISIBLE_DEVICES": "0"}, res, {"nvidia-smi": smi})
+    assert p.returncode == 0, p.stdout + p.stderr
+    csv = run_dir / "usage/task_0_gpu.csv"
+    for _ in range(50):                                     # the sampler runs in the background
+        if csv.exists() and csv.read_text():
+            break
+        time.sleep(0.1)
+    assert csv.read_text().strip().endswith("0, 42, 1234")
+
+
+def test_project_tag_reaches_meta_and_ledger(inproc, capsys):
+    inproc([])
+    cli.main(["--json", "submit", "smoke", "--partition", "short", "--project", "miller"])
+    assert json.loads(capsys.readouterr().out)["project"] == "miller"
+    assert cli.ledger_read()[-1]["project"] == "miller"
+
+
+def test_fetch_survives_runs_without_usage_dir(inproc, monkeypatch, capsys):
+    inproc([])
+
+    def rsync(self, src, dst, extra=None):
+        if "/usage/" in src:
+            raise cli.NuhpcError("rsync: change_dir failed (23)")
+    monkeypatch.setattr(cli.Remote, "rsync", rsync)
+    cli.main(["--json", "fetch", "r1"])
+    assert json.loads(capsys.readouterr().out)["local"].endswith("r1-20260101-000000")

@@ -21,11 +21,11 @@ You reach the cluster only through `nuhpc`. Never call `ssh`, `scp`, `rsync` or 
    - Make it resumable: skip rows already in the output file, so a timeout or requeue costs nothing.
    - Put large inputs and assets on the cluster with `nuhpc push` and reference them by remote path. The cluster has no macOS fonts: push the `.ttf` and pass its path as a param.
 4. **Dry-run first** for any new template or sweep shape: `nuhpc --json --dry-run submit ...`. It changes nothing on the cluster, and only writes the local stage folder (`local_stage`) so you can inspect it. Read `local_stage/job.sbatch` and check the resources, array size, `n_rows`, and `worst_case_gpu_hours`.
-5. **Pilot, then submit.** Run one small task first (a `limit` param, or a 1-row sweep) and check its runtime and output. Then `nuhpc --json submit TEMPLATE --name <short-descriptive> --code <dir> -p k=v ... [--sweep f | --grid k=a,b] [--pack] --profile <p>`. Record the `run_id`.
+5. **Pilot, then submit.** Run one small task first (a `limit` param, or a 1-row sweep) and check its runtime and output. Then `nuhpc --json submit TEMPLATE --name <short-descriptive> --project <project> --code <dir> -p k=v ... [--sweep f | --grid k=a,b] [--pack] --profile <p>`. Record the `run_id`. `--project` is a short, stable tag for the work the run serves (e.g. `miller`); reuse the tag earlier runs of that work used (`nuhpc --json runs`), and pass it to `run` too.
 6. **Wait with `nuhpc --json wait <run_id>... --timeout 540`.** Keep `--timeout` under your shell tool's time limit. Exit 3 means it timed out and the current states are included, so call it again, or run it in the background. It rides out network drops and returns final states plus the log tail of the first failed task. Don't hand-write polling loops. For progress mid-run, use `nuhpc --json logs <run_id> --task i --grep '^\[p|s/trial|Traceback|Error'`.
 7. **On failure,** read `failed_log_tail` or the logs. Fix the root cause, then resubmit only the failed configurations (a sweep file holding just those rows), not the whole sweep.
 8. **Collect.** `nuhpc --json fetch <run_id> --include '*.json' --include '*.jsonl' ...` Fetch only what the analysis needs; never fetch checkpoints unless asked.
-9. **Report** the run_ids, what ran, what failed and why, and where the results are locally.
+9. **Report** the run_ids, what ran, what failed and why, and where the results are locally. Add the compute from `nuhpc --json usage <run_id>...`: GPU-hours used against `req_gpu_h`. If `time_%` or `gpu_util_%` is low, say so and size the next submit from it (a shorter `--time`, a bigger batch, or a smaller GPU).
 
 ## Normal on Explorer (don't "fix" these)
 
