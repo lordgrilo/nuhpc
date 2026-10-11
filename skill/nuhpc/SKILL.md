@@ -14,7 +14,7 @@ You reach the cluster only through `nuhpc`. Never call `ssh`, `scp`, `rsync` or 
    - **Quick check** (does it import, does CUDA work, how long does one batch take):
      `nuhpc --json run --timeout 540 --code <dir> --profile a100x1 --partition gpu-short -- python probe.py`.
      It runs any command with no contract, 30 minutes unless `--time`, and returns the log and fetched `$HPC_OUT`. Exit 2 means the command failed (the log says why); exit 3 means it's still queued or running, so follow it with `nuhpc wait <run_id>`.
-   - **Logits, log-probs, hidden states, forced prefixes:** `python`. Your script loads the model with transformers. Run one task per model and loop over every condition inside it. Worked example: `run_vlm.py` in `miller-science/code/stroop_vlm/`, which took about 15 GPU-minutes for 9,500 trials on a 7B VLM.
+   - **Logits, log-probs, hidden states, forced prefixes:** `python`. Your script loads the model with transformers. Run one task per model and loop over every condition inside it. Worked example: [`examples/logprobs.py`](https://github.com/lordgrilo/nuhpc/blob/main/examples/logprobs.py), which scores candidate answers by log-probability and resumes. A script built this way ran 9,500 trials of a 7B VLM in about 15 GPU-minutes.
    - **Generated text at scale** (evals, prompt or sampling sweeps): `vllm_eval` with `--pack`. Rows that share a model then share one vLLM server, and the client runs once per row (`outputs/task_K/row_R/`).
    - **Weights:** run `hf_download` first, because jobs run with `HF_HUB_OFFLINE=1`.
 3. **Make code fit the contract.** The entry script takes `--params <json> --out <dir>` and writes everything it keeps into `--out`.
@@ -41,6 +41,6 @@ You reach the cluster only through `nuhpc`. Never call `ssh`, `scp`, `rsync` or 
 - **Use `a100x1` or `h200x1`**, adding `--partition gpu-short` (≤ 2 h, starts sooner) for pilots. Don't use `gpu1`: it can land on a 16 GB T4, or a V100 that this environment hasn't been tested on. Ask before multi-GPU: the `multigpu` partition needs RC access.
 - Request `--time` near the realistic runtime plus margin, not the partition maximum. For `vllm_eval`, that is up to 20 minutes of server startup plus the client's runtime for every row of a pack; 45 minutes covers a small pilot. Use `--max-parallel` so you don't flood the shared queue.
 - Weights must already be cached (`hf_download`). Gated models (Llama, Gemma) need an `HF_TOKEN`; ask the human.
-- The Python environment (`/projects/nplab/gio/envs/llm`) is the human's to change. The README records how it was built.
+- The Python environment (whatever `env_setup` activates) is the human's to change. If imports fail because it is missing or lacks a package, stop and give the human the command (`nuhpc submit env_build --profile cpu`, adding `-p extra="..."` for packages); don't run `env_build` yourself.
 - Don't cancel runs you didn't submit in this session unless asked.
 - If SSH fails with a hint to run `nuhpc connect`, stop and tell the human. Connecting is interactive and is theirs to do.

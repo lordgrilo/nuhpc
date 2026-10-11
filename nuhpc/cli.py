@@ -248,6 +248,7 @@ def all_templates(cfg: dict) -> list[Path]:
 
 
 PREAMBLE = r'''set -euo pipefail
+export HPC_REMOTE_ROOT="{remote_root}"
 export HPC_RUN_ID="{run_id}"
 export HPC_RUN_DIR="{run_dir}"
 export HPC_TASK_ID="${{SLURM_ARRAY_TASK_ID:-0}}"
@@ -343,7 +344,10 @@ def render(cfg, template: Path, res: dict, n_tasks: int, max_par: int | None,
     if left:
         raise NuhpcError(f"template uses unknown placeholders: {sorted(set(left))}. "
                          f"Per-task values belong in params: use $(hpc_param key).")
-    pre = PREAMBLE.format(run_id=run_id, run_dir=run_dir, env_setup=cfg["env_setup"].strip())
+    # A template that builds the environment can't run the env_setup that activates it.
+    env_setup = ("# skipped: this template declares '# env-setup: none'" if "# env-setup: none" in body.splitlines()
+                 else cfg["env_setup"].strip())
+    pre = PREAMBLE.format(run_id=run_id, run_dir=run_dir, remote_root=remote_path(cfg), env_setup=env_setup)
     return "\n".join(hdr) + "\n\n" + pre + "\n# ---- template: " + template.stem + " ----\n" + body
 
 

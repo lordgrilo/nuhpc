@@ -371,3 +371,47 @@ def test_fetch_survives_runs_without_usage_dir(inproc, monkeypatch, capsys):
     monkeypatch.setattr(cli.Remote, "rsync", rsync)
     cli.main(["--json", "fetch", "r1"])
     assert json.loads(capsys.readouterr().out)["local"].endswith("r1-20260101-000000")
+
+
+# ---- env_build: each user's own environment, built in a job ----
+
+def test_jobs_export_remote_root_before_env_setup(tmp_path):
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'ssh_host = "nowhere"\nremote_root = "{tmp_path}/remote"\n'
+                   'env_setup = "source \\"$HPC_REMOTE_ROOT/envs/llm/bin/activate\\""\n')
+    env = {**os.environ, "NUHPC_CONFIG": str(cfg), "NUHPC_STATE": str(tmp_path / "state")}
+    rc, res = nuhpc(env, "submit", "cmd", "--partition", "short", "-p", "cmd=true")
+    job = (Path(res["local_stage"]) / "job.sbatch").read_text()
+    assert job.index(f'export HPC_REMOTE_ROOT="{tmp_path}/remote"') < job.index('source "$HPC_REMOTE_ROOT/envs/llm')
+
+
+def test_env_build_runs_without_env_setup_and_builds_under_remote_root(tmp_path):
+    cfg = tmp_path / "config.toml"   # env_setup that would kill any job that ran it: the env doesn't exist yet
+    cfg.write_text(f'ssh_host = "nowhere"\nremote_root = "{tmp_path}/remote"\nenv_setup = "exit 99"\n')
+    env = {**os.environ, "NUHPC_CONFIG": str(cfg), "NUHPC_STATE": str(tmp_path / "state")}
+    log = tmp_path / "uv.log"
+    uv = (f'printf "%s|" "$@" >> {log}; echo >> {log}\n'
+          'if [ "$1" = venv ]; then mkdir -p "$4/bin"; printf "#!/bin/bash\\ncat >/dev/null; echo python-ok\\n" > "$4/bin/python"; '
+          'chmod +x "$4/bin/python"; fi')
+    boot = stub_bin(tmp_path, uv=uv)
+    pip = (f'#!/bin/bash\n# stub bootstrap python: "pip install --target DIR uv" puts uv in DIR/bin\n'
+           f'[ "$1 $2" = "-m pip" ] && [ "$3" = --version ] && exit 0\n'
+           f'mkdir -p "$6/bin" && cp {boot}/uv "$6/bin/uv"\n')
+    (tmp_path / "py").write_text(pip)
+    (tmp_path / "py").chmod(0o755)
+    rc, res = nuhpc(env, "submit", "env_build", "--partition", "short", "-p", f"bootstrap_python={tmp_path}/py")
+    assert rc == 0
+    assert "exit 99" not in (Path(res["local_stage"]) / "job.sbatch").read_text()
+    _, p = run_job(tmp_path, env, res, {})
+    assert p.returncode == 0, p.stdout + p.stderr
+    p = subprocess.run(["bash", str(Path(res["remote_dir"]) / "job.sbatch")], capture_output=True, text=True,
+                       env={**env, "PATH": f"{boot}:{env['PATH']}"})     # a second build reuses the venv
+    assert p.returncode == 0, p.stdout + p.stderr
+    calls = [l.split("|")[:-1] for l in log.read_text().splitlines()]
+    venv = f"{tmp_path}/remote/envs/llm"
+    assert calls[0] == ["venv", "--python", "3.12", venv]
+    assert calls[1][:3] == ["pip", "install", "--python"] and calls[1][3] == f"{venv}/bin/python"
+    assert "--torch-backend=cu129" in calls[1] and any(a.startswith("vllm @ https://") for a in calls[1])
+    assert calls[1][-2:] == ["huggingface_hub", "openai"]
+    assert [c[0] for c in calls[2:]] == ["pip"]                   # no second venv
+    assert "python-ok" in p.stdout and f'source "{venv}/bin/activate"' in p.stdout

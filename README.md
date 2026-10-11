@@ -2,7 +2,7 @@
 
 A small CLI for running GPU work on Northeastern's **Explorer** cluster (the successor of Discovery), from your laptop or from an agent (Claude Code, Codex).
 
-It covers quick one-off tests, larger batch jobs that run models directly, and high-throughput vLLM serving. It is pure Python standard library (3.11+), and it relies on `ssh` and `rsync` on the local machine.
+It covers quick one-off tests, larger batch jobs that run models directly, and high-throughput vLLM serving. It is pure Python standard library (3.11+), and it relies on `ssh` and `rsync` on the local machine. Underneath it is plain Slurm; see "On another Slurm cluster" for what is Explorer's.
 
 ```
 laptop / agent ──nuhpc──► ssh+rsync ──► login.explorer.northeastern.edu ──sbatch──► GPU nodes
@@ -28,6 +28,8 @@ How to choose:
 
 ## Quick start
 
+Each person sets nuhpc up once, with their own cluster account, config and Python environment. It takes about half an hour, most of it the environment building on the cluster.
+
 ```bash
 uv tool install git+https://github.com/lordgrilo/nuhpc    # or, from a clone: uv tool install --editable .
 nuhpc init                     # writes ~/.config/nuhpc/config.toml
@@ -35,7 +37,13 @@ nuhpc init                     # writes ~/.config/nuhpc/config.toml
 
 `uv` fetches a Python ≥3.11 if your system one is older. With `--editable`, edits to the clone take effect immediately; otherwise upgrade with `uv tool upgrade nuhpc`. Tests run offline: `uv run --no-project --with pytest --with-editable . pytest`.
 
-Edit the config: set `remote_root`, `env_setup`, and the profiles. `nuhpc/example_config.toml` holds the values that worked on 2026-10-07; lines marked `VERIFY` still need checking for your account.
+Then, in order:
+
+1. **Config.** In `~/.config/nuhpc/config.toml`, set `remote_root` to a folder of yours on project storage, such as `/projects/<group>/<you>/nuhpc`, and `ssh_host` (next section). The rest works as written: `env_setup` activates the environment that step 3 builds, and the profiles and limits are values that worked on 2026-10-07 (lines marked `VERIFY` are unchecked for other accounts).
+2. **SSH**, below; `nuhpc check` confirms it.
+3. **Python environment**, below: one `env_build` job.
+4. **First run**, below: the smoke test.
+5. **Agents**, optionally: link the skill (see Agents).
 
 ### SSH (the part that matters for unattended use)
 
@@ -56,23 +64,29 @@ With this block, `nuhpc connect` opens one authenticated session that every call
 
 ### Python environment
 
-Jobs activate whatever `env_setup` names, so build that environment once, **inside a job**. Explorer kills conda on login nodes (even `conda --version`). Project storage costs about 0.1 s per file written, so a serial `conda`/`pip` install of vLLM plus torch runs for hours. `uv` installs in parallel and finished in 19 minutes. Compute nodes have outbound internet. The shared Anaconda Python has pip; the system `python3` does not.
+Each person builds their own environment, once, in a job:
 
 ```bash
-# in an sbatch script (-p short -c 8 --mem=32G -t 06:00:00), or under `srun ... --pty bash`
-export UV_CACHE_DIR=/tmp/$USER-uv UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1   # precompile: first imports otherwise
-                                               # write each .pyc serially to /projects (stalled vLLM for 17 min)
-export UV_PYTHON_INSTALL_DIR=/projects/YOUR_GROUP/envs/.python   # the venv's interpreter must exist on every node
-/shared/EL9/explorer/anaconda3/2024.06/bin/python3 -m pip install --target /tmp/$USER-uvbin uv
-/tmp/$USER-uvbin/bin/uv venv --python 3.12 /projects/YOUR_GROUP/envs/llm
-/tmp/$USER-uvbin/bin/uv pip install --python /projects/YOUR_GROUP/envs/llm/bin/python --torch-backend=cu129 \
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.31.0/vllm-0.31.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl" \
-  huggingface_hub openai
+nuhpc submit env_build --profile cpu      # about 20 minutes; builds $remote_root/envs/llm (11 GB)
+nuhpc wait last && nuhpc logs last        # ends with the installed versions
 ```
 
-**Match CUDA to the driver.** A plain `pip install vllm` gets CUDA 13.0 wheels. Explorer's GPU driver (570.86 on 2026-10-07, CUDA ≤12.8) is too old for them: torch still reports `cuda available: True`, but the first kernel fails with "driver too old". CUDA 12.9 builds run on it, because NVIDIA keeps runtimes compatible within 12.x. Check `nvidia-smi` in the smoke log after any driver or version change; the smoke template launches a real kernel for this reason.
+It installs `uv`, Python 3.12, torch and vLLM 0.31 as CUDA 12.9 builds, plus `huggingface_hub` and `openai`, into `$remote_root/envs/llm`. The example config's `env_setup` activates exactly that path: inside every job, `$HPC_REMOTE_ROOT` is your `remote_root`. Params change what it builds (`nuhpc templates` lists them):
 
-`env_setup` then needs only `source /projects/YOUR_GROUP/envs/llm/bin/activate`. Put the environment on project storage rather than `$HOME`: it is 11 GB, and a lab can share one. Add what your own experiments need (e.g. `pip install` into the same venv, in a job).
+- `-p extra="huggingface_hub openai pandas"` sets the extra packages; keep the first two if you want them.
+- `-p vllm=none` skips vLLM, and `-p env=envs/other` builds a second environment beside the first.
+- On an existing environment it installs into it, which is how you add packages later. To start clean, build at a new path: deleting an environment is slow (see Cleaning up).
+
+The environment is per person on purpose: whoever builds it owns it, so nobody's running experiment changes when someone else adds a package.
+
+Why a job, and why built this way (all found on Explorer, 2026-10-07):
+
+- Explorer kills conda on login nodes, even `conda --version`. Compute nodes have outbound internet.
+- Project storage costs about 0.1 s per file written, so a serial `conda` or `pip` install of vLLM and torch runs for hours. `uv` installs in parallel and finished in 19 minutes. Its cache stays on the node's `/tmp`, files are copied rather than hardlinked across filesystems, and bytecode is compiled during the build; without that, first imports wrote each `.pyc` to `/projects` one by one and stalled vLLM for 17 minutes.
+- The interpreter goes to `envs/.python` on project storage, so every node can run it.
+- `uv` itself comes from PyPI through the shared Anaconda Python, which has pip; the system `python3` has none. `-p bootstrap_python=` names another.
+
+**Match CUDA to the driver.** A plain `pip install vllm` gets CUDA 13.0 wheels. Explorer's GPU driver (570.86 on 2026-10-07, CUDA ≤12.8) is too old for them: torch still reports `cuda available: True`, but the first kernel fails with "driver too old". CUDA 12.9 builds run on it, because NVIDIA keeps runtimes compatible within 12.x. Check `nvidia-smi` in the smoke log after any driver or version change; the smoke template launches a real kernel for this reason.
 
 ### First run
 
@@ -81,6 +95,8 @@ nuhpc check                                                   # SSH ok? lists pa
 nuhpc check --smoke --profile a100x1 --partition gpu-short    # a job testing GPU, a real CUDA kernel, imports, internet
 nuhpc wait last && nuhpc logs last                            # read the smoke results
 ```
+
+The smoke log should show `cuda kernel: ok` and the torch and vLLM versions that `env_build` printed.
 
 ## Day-to-day on Explorer
 
@@ -103,7 +119,7 @@ RUN can be a full `run_id`, a unique prefix, a Slurm job id, or `last`.
 - `runs/<run_id>/`: `job.sbatch`, `sweep.jsonl`, `packs.json`, `code/` (the snapshot), `outputs/task_K/` (`row_R/` when packed), `logs/`, and `usage/` (GPU samples).
 - `data/`: whatever you `push`.
 
-The environment and the HF cache sit wherever your `env_setup` points; ours are `envs/llm` and `hf_cache`. Locally: the config is `~/.config/nuhpc/config.toml`, the ledger, staged jobs and usage records are in `~/.local/share/nuhpc/`, and fetched results go to `~/nuhpc-results/<run_id>/`. Usage records are also copied to `~/.nuhpc/usage/` in your cluster home (see Usage).
+With the example config, your environment is `envs/llm` (its interpreter in `envs/.python`) and your HF cache is `hf_cache`, both under `remote_root`. Locally: the config is `~/.config/nuhpc/config.toml`, the ledger, staged jobs and usage records are in `~/.local/share/nuhpc/`, and fetched results go to `~/nuhpc-results/<run_id>/`. Usage records are also copied to `~/.nuhpc/usage/` in your cluster home (see Usage).
 
 **Partitions seen on 2026-10-07.**
 
@@ -159,13 +175,15 @@ This submits the command on a compute node with a 30-minute limit unless you pas
 Your script loads the model itself (transformers, or plain torch) and follows one contract: it takes `--params <params.json> --out <dir>` and writes what it keeps into `--out`. Make it **resumable**, skipping rows already in the output file, so a timeout or requeue costs nothing. Put one model in each task and loop over all conditions inside it; spread models across tasks with `--sweep`.
 
 ```bash
-# rows.jsonl: one line per model, e.g. {"entry": "run_vlm.py", "model": "Qwen/Qwen2.5-VL-7B-Instruct", "batch": 24}
-nuhpc submit hf_download --profile cpu -p repo=Qwen/Qwen2.5-VL-7B-Instruct        # weights first (jobs run offline)
-nuhpc submit python --name stroop --code . --sweep rows.jsonl --profile a100x1 --time 02:00:00
-nuhpc wait stroop && nuhpc fetch stroop --include '*.jsonl' --include '*.json'
+# rows.jsonl: one line per model, e.g. {"model": "Qwen/Qwen2.5-7B-Instruct"}; -p gives what every row shares
+nuhpc push ./questions.jsonl questions.jsonl                                     # rows of {"id", "prompt", "choices"}
+nuhpc submit hf_download --profile cpu -p repo=Qwen/Qwen2.5-7B-Instruct          # weights first (jobs run offline)
+nuhpc submit python --name scores --code examples --sweep rows.jsonl --profile a100x1 --time 01:00:00 \
+  -p entry=logprobs.py -p chat=true -p prompts=<remote_root>/data/questions.jsonl
+nuhpc wait scores && nuhpc fetch scores --include '*.jsonl' --include '*.json'
 ```
 
-Worked example: `miller-science/code/stroop_vlm/run_vlm.py` (VLM Stroop: next-token log-probs with an fp32 head, forced answer prefixes, and resume). The cluster has no macOS fonts, so it pushes Arial Bold to `data/fonts/` and passes the path as a param.
+The worked example is `examples/logprobs.py`. It scores candidate answers by the log-probability of each forced continuation, with all of a prompt's choices in one padded batch and the log-softmax in fp32, and it resumes. A research script built the same way ran 9,556 trials of a 7B VLM in about 15 GPU-minutes. If your script draws text into images, push the font and pass its path as a param: the cluster has no macOS fonts.
 
 ### vLLM at scale: `vllm_eval --pack`
 
@@ -234,6 +252,7 @@ Global flags: `--json` gives machine-readable output, including errors as `{"err
 | template | use |
 |---|---|
 | `smoke` | environment check (GPU, a real CUDA kernel, imports, internet, disk); run first and after any env change |
+| `env_build` | your Python environment: `uv`, Python 3.12, torch, vLLM; once per person, on a CPU profile |
 | `cmd` | any shell command, no contract (`nuhpc run` wraps it) |
 | `hf_download` | cache an HF model or dataset into `HF_HOME` on cluster storage |
 | `python` | your script: `python <entry> --params --out [args]` |
@@ -244,7 +263,7 @@ In a template, `{{CODE}} {{RUN_DIR}} {{DATA}} {{REMOTE_ROOT}} {{NODES}} {{GPUS_P
 
 Read parameters into variables first, as in `X="$(hpc_param key)"`. Under `set -e`, a missing parameter aborts the job only inside an assignment, not when the substitution is inline in a command.
 
-To add your own templates, drop `*.sbatch` files into `templates_dir`. Lines starting with `# doc:` show up in `nuhpc templates`, which is also how an agent learns what a template expects. A template supports `--pack` by declaring `# pack-by: key ...` (the params that must be equal within one task) and running its per-row work through `hpc_each_row CMD`, which sets `HPC_ROW_PARAMS` and `HPC_ROW_OUT` for each row.
+To add your own templates, drop `*.sbatch` files into `templates_dir`. Lines starting with `# doc:` show up in `nuhpc templates`, which is also how an agent learns what a template expects. A template that must run without `env_setup`, as `env_build` does, declares `# env-setup: none`. Every job exports `HPC_REMOTE_ROOT`, `HPC_RUN_ID`, `HPC_RUN_DIR`, `HPC_TASK_ID`, `HPC_OUT` and `HPC_PARAMS`. A template supports `--pack` by declaring `# pack-by: key ...` (the params that must be equal within one task) and running its per-row work through `hpc_each_row CMD`, which sets `HPC_ROW_PARAMS` and `HPC_ROW_OUT` for each row.
 
 ## Agents
 
@@ -299,6 +318,17 @@ Every row below happened while setting this up (2026-10-07/09).
 | a job pending for a long time | see "Why a job is pending" | — |
 | `status` says `SUBMITTED` | `sacct` hasn't caught up yet | wait a few seconds |
 
+## On another Slurm cluster
+
+The code is plain Slurm: `ssh` and `rsync` locally; `sbatch`, `sacct`, `sinfo`, `squeue` and `scancel` on the cluster. What is Explorer's:
+
+- `example_config.toml`: the partitions, the GPU types in the profiles, and the limits.
+- The `env_build` defaults: `bootstrap_python` (Explorer's shared Anaconda; elsewhere, any Python with pip), and `torch_backend=cu129` with the cu129 vLLM wheel. Match these to your driver (`nvidia-smi`).
+- `vllm_eval` sets `no_proxy` for localhost, which is harmless where there is no proxy.
+- This README's measured times, driver notes and troubleshooting table.
+
+Everything else, the usage accounting included, reads standard Slurm output.
+
 ## Design notes
 
 - **Verbs, not a shell.** An agent can only call `run / submit / wait / status / logs / fetch / usage / cancel / push / pull / ls`. There is no `exec` on the login node, and remote paths are confined to `remote_root`; the one exception is the fixed `~/.nuhpc/usage/` folder that nuhpc itself writes usage records to. Code you upload does run on compute nodes; that is the point, and it stays inside Slurm's accounting.
@@ -314,3 +344,8 @@ Every row below happened while setting this up (2026-10-07/09).
 - Globus support is a thin wrapper over the `globus` CLI. It needs `globus login` once plus both endpoint UUIDs in the config.
 - The ledger is local to each machine. Runs submitted from another laptop are visible in `queue`, but not in `runs`, `status`, `wait` or `usage`. Their usage records do reach `~/.nuhpc/usage/` on the cluster, which `nuhpc usage` doesn't read yet.
 - `pull` of a directory nests it one level deeper (`pulled/x/x`), because of rsync's trailing-slash rule.
+- The local side has been run on macOS only. Linux should work as it is (it needs `ssh` and `rsync`); Windows needs WSL.
+
+## License
+
+MIT; see [LICENSE](LICENSE). Changes are listed in [CHANGELOG.md](CHANGELOG.md).

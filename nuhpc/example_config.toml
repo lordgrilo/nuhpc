@@ -2,17 +2,17 @@
 # Values marked VERIFY are guesses about Explorer: confirm with `nuhpc check` / RC docs.
 
 ssh_host = "explorer"                     # Host alias from ~/.ssh/config (see README)
-remote_root = "/scratch/YOUR_USER/nuhpc"  # all runs/, data/ live here. VERIFY scratch purge policy;
-                                          # anything you need to keep: fetch it, or use /projects/<group>.
+remote_root = "/projects/YOUR_GROUP/YOUR_USER/nuhpc"   # runs/, data/, your env (envs/) and HF cache live here.
+                                          # Project storage: not purged. Scratch may be purged or unwritable.
 local_results = "~/nuhpc-results"
 templates_dir = ""                        # optional dir with your own *.sbatch templates (shadows built-ins)
-default_profile = "gpu1"
+default_profile = "a100x1"                # gpu1 can land on a 16 GB T4 or an untested V100
 
-# Pasted verbatim at the top of every job, after Slurm directives.
+# Pasted verbatim at the top of every job, after Slurm directives; $HPC_REMOTE_ROOT is remote_root.
 env_setup = """
-source /projects/YOUR_GROUP/envs/llm/bin/activate   # a uv venv built inside a job: README "Python environment"
+source "$HPC_REMOTE_ROOT/envs/llm/bin/activate"   # your own env, built once by: nuhpc submit env_build --profile cpu
 # module load cuda/12.8.0                      # modules: 12.1.1, 12.3.0, 12.8.0, 13.2.0. pip torch bundles CUDA
-export HF_HOME=/projects/YOUR_GROUP/hf_cache   # keep model weights off $HOME; /scratch/$USER if it is writable
+export HF_HOME="$HPC_REMOTE_ROOT/hf_cache"     # model weights: off $HOME (small quota)
 export HF_HUB_OFFLINE=1                        # cached weights only (compute nodes do have internet; this is for reproducibility)
 export TOKENIZERS_PARALLELISM=false
 """
