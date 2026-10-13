@@ -6,7 +6,7 @@ It covers quick one-off tests, larger batch jobs that run models directly, and h
 
 ```
 laptop / agent ──nuhpc──► ssh+rsync ──► login.explorer.northeastern.edu ──sbatch──► GPU nodes
-                 ledger                    $remote_root/runs/<run_id>/{job.sbatch, sweep.jsonl, code/, outputs/, logs/, usage/}
+                 ledger                    <work root>/runs/<run_id>/{job.sbatch, sweep.jsonl, code/, outputs/, logs/, usage/}
 ```
 
 ## Which mode?
@@ -39,7 +39,7 @@ nuhpc init                     # writes ~/.config/nuhpc/config.toml
 
 Then, in order:
 
-1. **Config.** In `~/.config/nuhpc/config.toml`, set `remote_root` to a folder of yours on project storage, such as `/projects/<group>/<you>/nuhpc`, and `ssh_host` (next section). The rest works as written: `env_setup` activates the environment that step 3 builds, and the profiles and limits are values that worked on 2026-10-07 (lines marked `VERIFY` are unchecked for other accounts).
+1. **Config.** In `~/.config/nuhpc/config.toml`, set `user_dir` to your own folder on project storage, such as `/projects/<group>/<you>` (`nuhpc init --user-dir` writes it for you), and `ssh_host` (next section). Environments and the model cache go there; runs and data go to a `nuhpc/` folder inside it, or inside a project directory you declare (see Where things live). The rest works as written: `env_setup` activates the environment that step 3 builds, and the profiles and limits are values that worked on 2026-10-07 (lines marked `VERIFY` are unchecked for other accounts).
 2. **SSH**, below; `nuhpc check` confirms it.
 3. **Python environment**, below: one `env_build` job.
 4. **First run**, below: the smoke test.
@@ -67,11 +67,11 @@ With this block, `nuhpc connect` opens one authenticated session that every call
 Each person builds their own environment, once, in a job:
 
 ```bash
-nuhpc submit env_build --profile cpu      # about 20 minutes; builds $remote_root/envs/llm (11 GB)
+nuhpc submit env_build --profile cpu      # about 20 minutes; builds <user_dir>/envs/llm (11 GB)
 nuhpc wait last && nuhpc logs last        # ends with the installed versions
 ```
 
-It installs `uv`, Python 3.12, torch and vLLM 0.31 as CUDA 12.9 builds, plus `huggingface_hub` and `openai`, into `$remote_root/envs/llm`. The example config's `env_setup` activates exactly that path: inside every job, `$HPC_REMOTE_ROOT` is your `remote_root`. Params change what it builds (`nuhpc templates` lists them):
+It installs `uv`, Python 3.12, torch and vLLM 0.31 as CUDA 12.9 builds, plus `huggingface_hub` and `openai`, into `<user_dir>/envs/llm`. The example config's `env_setup` activates exactly that path: inside every job, `$HPC_USER_DIR` is your `user_dir`. Environments live there, not in a project directory, so all your projects share them. Params change what it builds (`nuhpc templates` lists them):
 
 - `-p extra="huggingface_hub openai pandas"` sets the extra packages; keep the first two if you want them.
 - `-p vllm=none` skips vLLM, and `-p env=envs/other` builds a second environment beside the first.
@@ -108,18 +108,37 @@ nuhpc wait RUN                                 # block until done; survives lapt
 nuhpc logs RUN --task 3 --grep 'Traceback|Error|s/trial'                      # progress or errors only
 nuhpc fetch RUN --include '*.json' --include '*.jsonl'                        # results to ~/nuhpc-results/RUN
 nuhpc usage --since 7d                         # compute used vs requested per run, totals per project
-nuhpc push ./stimuli stimuli                   # inputs to $remote_root/data/stimuli
+nuhpc push ./stimuli stimuli                   # inputs to <work root>/data/stimuli (add --project NAME for a project's)
 nuhpc cancel RUN                               # scancel
 ```
 
 RUN can be a full `run_id`, a unique prefix, a Slurm job id, or `last`.
 
-**Where things live.** On the cluster, under `remote_root`:
+**Where things live.** On the cluster, installs and work are kept apart:
 
-- `runs/<run_id>/`: `job.sbatch`, `sweep.jsonl`, `packs.json`, `code/` (the snapshot), `outputs/task_K/` (`row_R/` when packed), `logs/`, and `usage/` (GPU samples).
-- `data/`: whatever you `push`.
+```
+<user_dir>/                      your folder, e.g. /projects/<group>/<you>
+├── envs/                        environments (llm/, .python/): shared by all your projects
+├── hf_cache/                    model weights
+├── nuhpc/                       default work root
+│   ├── runs/<run_id>/           job.sbatch, sweep.jsonl, packs.json, code/ (the snapshot),
+│   │                            outputs/task_K/ (row_R/ when packed), logs/, usage/ (GPU samples)
+│   └── data/                    whatever you `push`
+└── <project dir>/nuhpc/         the same runs/ and data/, for a declared project
+```
 
-With the example config, your environment is `envs/llm` (its interpreter in `envs/.python`) and your HF cache is `hf_cache`, both under `remote_root`. Locally: the config is `~/.config/nuhpc/config.toml`, the ledger, staged jobs and usage records are in `~/.local/share/nuhpc/`, and fetched results go to `~/nuhpc-results/<run_id>/`. Usage records are also copied to `~/.nuhpc/usage/` in your cluster home (see Usage).
+A project directory is declared in the config and chosen with `--project NAME` on `submit`, `run`, `push`, `pull`, `ls` and `check`:
+
+```toml
+[projects.miller]
+dir = "/projects/<group>/<you>/miller"       # may be anywhere you can write
+```
+
+`nuhpc submit python --project miller ...` then keeps that run in `<dir>/nuhpc/runs/`, and `nuhpc push ./stimuli --project miller` puts the data in `<dir>/nuhpc/data/`. Inside the job, `$HPC_REMOTE_ROOT` is that work root. Everything nuhpc writes sits in a `nuhpc/` folder, so it never mixes with your own project files. A project name with no entry in the config is only a tag for `nuhpc usage`, and the run uses the default location; the `remote_dir` in the submit output shows where it went. Only directories listed in the config can be used, so an agent cannot write anywhere else. `nuhpc check [--project NAME]` verifies `user_dir` and creates the work root.
+
+Older configs that set only `remote_root` keep working unchanged: it is the work root, and `envs/` and `hf_cache/` sit beside `runs/` in it. If a config sets both, `user_dir` holds the installs and `remote_root` replaces `<user_dir>/nuhpc` as the default work root.
+
+Locally: the config is `~/.config/nuhpc/config.toml`, the ledger, staged jobs and usage records are in `~/.local/share/nuhpc/`, and fetched results go to `~/nuhpc-results/<run_id>/`. Usage records are also copied to `~/.nuhpc/usage/` in your cluster login home (not `user_dir`; see Usage).
 
 **Partitions seen on 2026-10-07.**
 
@@ -148,14 +167,14 @@ With the example config, your environment is `envs/llm` (its interpreter in `env
 
 - `~/.local/share/nuhpc/usage/`: every run submitted from this machine; what `nuhpc usage` reads.
 - `~/nuhpc-results/<run_id>/usage.json`: beside the results, once fetched (the CSVs come along in `usage/`).
-- `~/.nuhpc/usage/` in your cluster home: outside `remote_root`, so cleaning `runs/` keeps it, and shared by every machine that submits as you.
+- `~/.nuhpc/usage/` in your cluster login home: outside every work root, so cleaning `runs/` keeps it, and shared by every machine that submits as you.
 
 `nuhpc usage [RUN...] [--since 7d|all] [--project P]` prints one row per finished run and totals per project; the first call also records any older run that lacks a record (the GPU columns stay empty for runs from before the sampler). `mem_%` is Slurm's peak memory over the request, and can pass 100 % without an out-of-memory kill: a model download on Explorer showed 168 %. Tag runs with `submit --project P` (or `run --project P`) to make the per-project totals mean something. If the cluster can't be reached when a run is first seen finished, the command warns `usage not recorded` and carries on; the next `wait`, `fetch` or `usage` records the run from Slurm's accounting, so nothing is lost.
 
 **Cleaning up.** Run folders stay in `runs/` until you delete them: a few KB of logs for a test, MB of outputs for an experiment. `fetch` what you keep, then delete old runs yourself:
 
 ```bash
-ssh YOUR_NU_USERNAME@login.explorer.northeastern.edu 'cd <remote_root>/runs && rm -rf -- <run_id> <run_id>'
+ssh YOUR_NU_USERNAME@login.explorer.northeastern.edu 'cd <work root>/runs && rm -rf -- <run_id> <run_id>'
 ```
 
 There is deliberately no `nuhpc` delete command, so an agent allowed to run `nuhpc` cannot destroy results. Deleting a run folder leaves alone its ledger entry (history), its usage records, its fetched copy in `~/nuhpc-results/`, and any weights it cached in `HF_HOME`; `logs` and `fetch` on that run fail afterwards. The local staging copies in `~/.local/share/nuhpc/runs/` can go at any time. To delete something with thousands of files, such as an old Python environment, do it inside a job with parallel deletes (`find DIR -type f -print0 | xargs -0 -P 16 rm -f`): file operations on `/projects` cost about 0.1 s each. Environments built in the same folder share its `.python` interpreter store (`envs/.python` beside `envs/llm`), so deleting an environment means deleting its own folder only, never `.python`, which the others run from. The `home =` line of each environment's `pyvenv.cfg` names the interpreter it uses; that one can go too once no other environment's `pyvenv.cfg` names it.
@@ -179,7 +198,7 @@ Your script loads the model itself (transformers, or plain torch) and follows on
 nuhpc push ./questions.jsonl questions.jsonl                                     # rows of {"id", "prompt", "choices"}
 nuhpc submit hf_download --profile cpu -p repo=Qwen/Qwen2.5-7B-Instruct          # weights first (jobs run offline)
 nuhpc submit python --name scores --code examples --sweep rows.jsonl --profile a100x1 --time 01:00:00 \
-  -p entry=logprobs.py -p chat=true -p prompts=<remote_root>/data/questions.jsonl
+  -p entry=logprobs.py -p chat=true -p prompts=<work root>/data/questions.jsonl
 nuhpc wait scores && nuhpc fetch scores --include '*.jsonl' --include '*.json'
 ```
 
@@ -225,10 +244,11 @@ Model size drives queue time more than anything else: one A100-80GB or H200 job 
 | `nuhpc usage [RUN...] [--since 7d\|all] [--project P]` | compute used vs requested per finished run, totals per project (see Usage) |
 | `nuhpc cancel RUN [--task i]` | `scancel` a whole run or one array task |
 | `nuhpc runs` / `nuhpc queue` | local ledger / your jobs in `squeue` |
-| `nuhpc push LOCAL [REL] [--globus]` | upload data to `remote_root/data/REL` |
-| `nuhpc pull REL [LOCAL] [--globus]` | download a path relative to `remote_root` |
-| `nuhpc ls [REL]` | list a directory under `remote_root` |
-| `nuhpc check [--smoke]` / `nuhpc connect` | verify SSH and list partitions / open the persistent SSH session (interactive) |
+| `nuhpc push LOCAL [REL] [--project P] [--globus]` | upload data to `<work root>/data/REL` |
+| `nuhpc pull REL [LOCAL] [--project P] [--globus]` | download a path relative to the work root |
+| `nuhpc ls [REL] [--project P]` | list a directory under the work root |
+| `nuhpc check [--smoke] [--project P]` / `nuhpc connect` | verify SSH and `user_dir`, create the work root, list partitions / open the persistent SSH session (interactive) |
+| `nuhpc init [--user-dir DIR]` | write the example config, with your `user_dir` filled in |
 
 Global flags: `--json` gives machine-readable output, including errors as `{"error": ...}`. `--dry-run` changes nothing on the cluster: it prints every remote command and leaves the rendered `job.sbatch` in `~/.local/share/nuhpc/runs/<run_id>/` for inspection.
 
@@ -242,7 +262,8 @@ Global flags: `--json` gives machine-readable output, including errors as `{"err
 --pack                one array task per group of rows sharing the template's `# pack-by:` keys
                       (vllm_eval: one server per model; the client runs once per row)
 --max-parallel N      array throttle
---project NAME        tag for usage accounting (nuhpc usage --project NAME)
+--project NAME        tag for usage accounting (nuhpc usage --project NAME); a project declared in the
+                      config also selects that project's directory for the run's runs/ and data/
 --profile NAME        resource preset; override with --partition --time --gpus --mem --cpus --nodes --gres
 --confirm-big         bypass limits (humans only)
 ```
@@ -259,11 +280,11 @@ Global flags: `--json` gives machine-readable output, including errors as `{"err
 | `vllm_eval` | vLLM OpenAI-compatible server + your client; supports `--pack` |
 | `train_ddp` | `srun torchrun` across 1..N nodes with c10d rendezvous |
 
-In a template, `{{CODE}} {{RUN_DIR}} {{DATA}} {{REMOTE_ROOT}} {{NODES}} {{GPUS_PER_NODE}} {{GPUS}} {{CPUS}}` are filled at render time. Per-task values come from `hpc_param KEY [DEFAULT]` at run time.
+In a template, `{{CODE}} {{RUN_DIR}} {{DATA}} {{REMOTE_ROOT}} {{USER_DIR}} {{NODES}} {{GPUS_PER_NODE}} {{GPUS}} {{CPUS}}` are filled at render time. Per-task values come from `hpc_param KEY [DEFAULT]` at run time.
 
 Read parameters into variables first, as in `X="$(hpc_param key)"`. Under `set -e`, a missing parameter aborts the job only inside an assignment, not when the substitution is inline in a command.
 
-To add your own templates, drop `*.sbatch` files into `templates_dir`. Lines starting with `# doc:` show up in `nuhpc templates`, which is also how an agent learns what a template expects. A template that must run without `env_setup`, as `env_build` does, declares `# env-setup: none`. Every job exports `HPC_REMOTE_ROOT`, `HPC_RUN_ID`, `HPC_RUN_DIR`, `HPC_TASK_ID`, `HPC_OUT` and `HPC_PARAMS`. A template supports `--pack` by declaring `# pack-by: key ...` (the params that must be equal within one task) and running its per-row work through `hpc_each_row CMD`, which sets `HPC_ROW_PARAMS` and `HPC_ROW_OUT` for each row.
+To add your own templates, drop `*.sbatch` files into `templates_dir`. Lines starting with `# doc:` show up in `nuhpc templates`, which is also how an agent learns what a template expects. A template that must run without `env_setup`, as `env_build` does, declares `# env-setup: none`. Every job exports `HPC_USER_DIR`, `HPC_REMOTE_ROOT`, `HPC_RUN_ID`, `HPC_RUN_DIR`, `HPC_TASK_ID`, `HPC_OUT` and `HPC_PARAMS`. A template supports `--pack` by declaring `# pack-by: key ...` (the params that must be equal within one task) and running its per-row work through `hpc_each_row CMD`, which sets `HPC_ROW_PARAMS` and `HPC_ROW_OUT` for each row.
 
 ## Agents
 
@@ -331,7 +352,7 @@ Everything else, the usage accounting included, reads standard Slurm output.
 
 ## Design notes
 
-- **Verbs, not a shell.** An agent can only call `run / submit / wait / status / logs / fetch / usage / cancel / push / pull / ls`. There is no `exec` on the login node, and remote paths are confined to `remote_root`; the one exception is the fixed `~/.nuhpc/usage/` folder that nuhpc itself writes usage records to. Code you upload does run on compute nodes; that is the point, and it stays inside Slurm's accounting.
+- **Verbs, not a shell.** An agent can only call `run / submit / wait / status / logs / fetch / usage / cancel / push / pull / ls`. There is no `exec` on the login node, and remote paths are confined to the work root of a directory you listed in the config; the one exception is the fixed `~/.nuhpc/usage/` folder that nuhpc itself writes usage records to. Code you upload does run on compute nodes; that is the point, and it stays inside Slurm's accounting.
 - **Every job is a run.** Each run is a frozen snapshot of the rendered sbatch, the parameters, and the code. That makes runs reproducible and easy to inspect: everything lives in `runs/<run_id>/`.
 - **One contract for batch code.** Your script takes `--params <params.json> --out <dir>` and writes what it wants kept into `--out`. Sweeps, evals and training all use this shape. Quick tests (`run`/`cmd`) skip it.
 - **Sweeps are job arrays.** There is one task per row, or per pack, throttled with `%max_parallel`. This is how you run models or configurations in parallel without monopolising the GPU queue.
@@ -340,7 +361,7 @@ Everything else, the usage accounting included, reads standard Slurm output.
 ## Known gaps
 
 - Partition names, GPU type strings, time limits and `module` names are what one account saw on 2026-10-07. Confirm yours with `nuhpc check` and `module avail`.
-- `/scratch/$USER` can exist but be root-owned and unwritable. Check before pointing `HF_HOME` or `remote_root` at it. Check RC's scratch purge policy before relying on scratch at all.
+- `/scratch/$USER` can exist but be root-owned and unwritable. Check before pointing `HF_HOME`, `user_dir` or a project directory at it. Check RC's scratch purge policy before relying on scratch at all.
 - Globus support is a thin wrapper over the `globus` CLI. It needs `globus login` once plus both endpoint UUIDs in the config.
 - The ledger is local to each machine. Runs submitted from another laptop are visible in `queue`, but not in `runs`, `status`, `wait` or `usage`. Their usage records do reach `~/.nuhpc/usage/` on the cluster, which `nuhpc usage` doesn't read yet.
 - `pull` of a directory nests it one level deeper (`pulled/x/x`), because of rsync's trailing-slash rule.

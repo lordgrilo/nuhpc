@@ -2,17 +2,28 @@
 # Values marked VERIFY are guesses about Explorer: confirm with `nuhpc check` / RC docs.
 
 ssh_host = "explorer"                     # Host alias from ~/.ssh/config (see README)
-remote_root = "/projects/YOUR_GROUP/YOUR_USER/nuhpc"   # runs/, data/, your env (envs/) and HF cache live here.
-                                          # Project storage: not purged. Scratch may be purged or unwritable.
+user_dir = "/projects/YOUR_GROUP/YOUR_USER"   # YOUR folder on project storage (`nuhpc init --user-dir` sets it).
+                                          # Installs live here: envs/ and hf_cache/, shared by all your projects.
+                                          # Runs and data go to <user_dir>/nuhpc/, or to a declared project (below).
+                                          # Project storage is not purged; scratch may be purged or unwritable.
+# remote_root = "..."                     # optional: put the default runs/ and data/ somewhere other than
+                                          # <user_dir>/nuhpc (older configs set only this; it then also holds envs/)
 local_results = "~/nuhpc-results"
 templates_dir = ""                        # optional dir with your own *.sbatch templates (shadows built-ins)
 default_profile = "a100x1"                # gpu1 can land on a 16 GB T4 or an untested V100
 
-# Pasted verbatim at the top of every job, after Slurm directives; $HPC_REMOTE_ROOT is remote_root.
+# Project directories, chosen with `--project NAME` on submit, run, push, pull, ls and check. Each project keeps
+# its runs/ and data/ in <dir>/nuhpc/; envs and the HF cache stay in user_dir. A project name with no entry here
+# is only a tag (for `nuhpc usage`) and uses the default location. Only directories listed here can be used.
+# [projects.miller]
+# dir = "/projects/YOUR_GROUP/YOUR_USER/miller"
+
+# Pasted verbatim at the top of every job, after Slurm directives.
+# $HPC_USER_DIR is user_dir; $HPC_REMOTE_ROOT is the run's work root (its project's <dir>/nuhpc, or the default).
 env_setup = """
-source "$HPC_REMOTE_ROOT/envs/llm/bin/activate"   # your own env, built once by: nuhpc submit env_build --profile cpu
+source "$HPC_USER_DIR/envs/llm/bin/activate"   # your own env, built once by: nuhpc submit env_build --profile cpu
 # module load cuda/12.8.0                      # modules: 12.1.1, 12.3.0, 12.8.0, 13.2.0. pip torch bundles CUDA
-export HF_HOME="$HPC_REMOTE_ROOT/hf_cache"     # model weights: off $HOME (small quota)
+export HF_HOME="$HPC_USER_DIR/hf_cache"        # model weights: off $HOME (small quota), shared by your projects
 export HF_HUB_OFFLINE=1                        # cached weights only (compute nodes do have internet; this is for reproducibility)
 export TOKENIZERS_PARALLELISM=false
 """

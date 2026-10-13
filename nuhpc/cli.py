@@ -1,7 +1,8 @@
 """nuhpc: an agent-friendly CLI for running Slurm jobs on Northeastern's Explorer cluster.
 
 Design rules:
-  * Everything remote lives under `remote_root`; remote paths given on the CLI are relative to it.
+  * Installs (envs/, hf_cache/) live under `user_dir`; work (runs/, data/) under a nuhpc/ folder in the project's
+    directory, or in user_dir. Remote paths given on the CLI are relative to that work root.
   * Every job is a *run*: rendered sbatch + params + code snapshot in runs/<run_id>/ on the cluster.
   * Every command supports --json so an agent can parse results; humans get tables.
   * No arbitrary remote exec. The agent gets verbs, not a shell.
@@ -52,23 +53,49 @@ def load_config() -> dict:
     if not CONFIG_PATH.exists():
         raise NuhpcError(f"No config at {CONFIG_PATH}. Run `nuhpc init` and edit it.")
     cfg = tomllib.loads(CONFIG_PATH.read_text())
-    for key in ("ssh_host", "remote_root"):
-        if key not in cfg:
-            raise NuhpcError(f"config is missing required key '{key}'")
+    if "ssh_host" not in cfg:
+        raise NuhpcError("config is missing required key 'ssh_host'")
+    if not (cfg.get("user_dir") or cfg.get("remote_root")):
+        raise NuhpcError("config needs user_dir: your folder on project storage, e.g. /projects/<group>/<you>")
+    for key in ("user_dir", "remote_root"):
+        if key in cfg:
+            if not str(cfg[key]).startswith("/"):
+                raise NuhpcError(f"{key} must be an absolute path on the cluster, got '{cfg[key]}'")
+            if "YOUR_" in cfg[key]:
+                raise NuhpcError(f"{key} still has the placeholder '{cfg[key]}': edit {CONFIG_PATH}")
     cfg.setdefault("local_results", "~/nuhpc-results")
     cfg.setdefault("env_setup", "")
     cfg.setdefault("profiles", {})
     cfg.setdefault("limits", {})
     cfg.setdefault("templates_dir", "")
     cfg.setdefault("globus", {})
+    cfg.setdefault("projects", {})
+    for name, proj in cfg["projects"].items():
+        if not (isinstance(proj, dict) and str(proj.get("dir", "")).startswith("/")):
+            raise NuhpcError(f"[projects.{name}] needs dir = an absolute path on the cluster")
     return cfg
 
 
-def remote_path(cfg: dict, rel: str = "") -> str:
+def user_dir(cfg: dict) -> str:
+    """Where installs live (envs/, hf_cache/): shared by all the user's projects. Legacy configs: remote_root."""
+    return (cfg.get("user_dir") or cfg["remote_root"]).rstrip("/")
+
+
+def work_root(cfg: dict, project: str | None = None) -> str:
+    """Where runs/ and data/ live: nuhpc/ inside the declared project's dir, else the configured default.
+    The default is remote_root if set (older configs), else nuhpc/ inside user_dir. An undeclared project
+    name is only a tag."""
+    proj = cfg["projects"].get(project) if project else None
+    if proj:
+        return proj["dir"].rstrip("/") + "/nuhpc"
+    return (cfg.get("remote_root") or user_dir(cfg) + "/nuhpc").rstrip("/")
+
+
+def remote_path(cfg: dict, rel: str = "", project: str | None = None) -> str:
     rel = (rel or "").strip()
     if rel.startswith("/") or ".." in Path(rel).parts:
-        raise NuhpcError("remote paths are relative to remote_root (no absolute paths, no '..')")
-    root = cfg["remote_root"].rstrip("/")
+        raise NuhpcError("remote paths are relative to the work root (no absolute paths, no '..')")
+    root = work_root(cfg, project)
     return f"{root}/{rel}" if rel else root
 
 
@@ -248,6 +275,7 @@ def all_templates(cfg: dict) -> list[Path]:
 
 
 PREAMBLE = r'''set -euo pipefail
+export HPC_USER_DIR="{user_dir}"
 export HPC_REMOTE_ROOT="{remote_root}"
 export HPC_RUN_ID="{run_id}"
 export HPC_RUN_DIR="{run_dir}"
@@ -314,7 +342,7 @@ fi
 
 
 def render(cfg, template: Path, res: dict, n_tasks: int, max_par: int | None,
-           run_id: str, run_dir: str, job_name: str) -> str:
+           run_id: str, run_dir: str, job_name: str, project: str | None = None) -> str:
     gpn = gpus_per_node(res)
     hdr = ["#!/bin/bash",
            f"#SBATCH --job-name={job_name}",
@@ -335,7 +363,8 @@ def render(cfg, template: Path, res: dict, n_tasks: int, max_par: int | None,
     else:
         hdr.append(f"#SBATCH --output={run_dir}/logs/%x-%j.out")
     ctx = {"RUN_ID": run_id, "RUN_DIR": run_dir, "CODE": f"{run_dir}/code",
-           "DATA": remote_path(cfg, "data"), "REMOTE_ROOT": remote_path(cfg),
+           "DATA": remote_path(cfg, "data", project), "REMOTE_ROOT": remote_path(cfg, project=project),
+           "USER_DIR": user_dir(cfg),
            "NODES": str(res["nodes"]), "GPUS_PER_NODE": str(gpn),
            "GPUS": str(gpn * int(res["nodes"])), "CPUS": str(res["cpus"])}
     body = template.read_text()
@@ -347,7 +376,8 @@ def render(cfg, template: Path, res: dict, n_tasks: int, max_par: int | None,
     # A template that builds the environment can't run the env_setup that activates it.
     env_setup = ("# skipped: this template declares '# env-setup: none'" if "# env-setup: none" in body.splitlines()
                  else cfg["env_setup"].strip())
-    pre = PREAMBLE.format(run_id=run_id, run_dir=run_dir, remote_root=remote_path(cfg), env_setup=env_setup)
+    pre = PREAMBLE.format(run_id=run_id, run_dir=run_dir, user_dir=user_dir(cfg),
+                          remote_root=remote_path(cfg, project=project), env_setup=env_setup)
     return "\n".join(hdr) + "\n\n" + pre + "\n# ---- template: " + template.stem + " ----\n" + body
 
 
@@ -556,10 +586,16 @@ EXAMPLE_CONFIG = (Path(__file__).parent / "example_config.toml")
 def cmd_init(args, cfg, R):
     if CONFIG_PATH.exists() and not args.force:
         raise NuhpcError(f"{CONFIG_PATH} exists (use --force to overwrite)")
+    text = EXAMPLE_CONFIG.read_text()
+    if args.user_dir:
+        if not args.user_dir.startswith("/"):
+            raise NuhpcError("--user-dir must be an absolute path on the cluster, e.g. /projects/<group>/<you>")
+        text = text.replace("/projects/YOUR_GROUP/YOUR_USER", args.user_dir.rstrip("/"))
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(EXAMPLE_CONFIG.read_text())
-    emit({"config": str(CONFIG_PATH), "next": "edit it, add the ~/.ssh/config block from the README, "
-          "then `nuhpc connect` and `nuhpc check --smoke`"}, args)
+    CONFIG_PATH.write_text(text)
+    emit({"config": str(CONFIG_PATH), "next": ("add the ~/.ssh/config block from the README, then `nuhpc connect` "
+          "and `nuhpc check --smoke`" if args.user_dir else "set user_dir (your folder on project storage) and "
+          "ssh_host, add the ~/.ssh/config block from the README, then `nuhpc connect` and `nuhpc check --smoke`")}, args)
 
 
 def cmd_connect(args, cfg, R):
@@ -576,14 +612,24 @@ def cmd_connect(args, cfg, R):
 
 
 def cmd_check(args, cfg, R):
-    root = remote_path(cfg)
-    out = R.run(f"echo ok; hostname; mkdir -p {shlex.quote(root)}; df -h {shlex.quote(root)} | tail -1; "
+    project = getattr(args, "project", None)
+    home, root = shlex.quote(user_dir(cfg)), shlex.quote(remote_path(cfg, project=project))
+    # The work root is created only when user_dir exists and is writable: a typo must not become a new folder.
+    out = R.run(f"echo ok; hostname; "
+                f"if [ ! -d {home} ]; then echo 'user_dir: MISSING'; elif [ ! -w {home} ]; then echo 'user_dir: not writable'; "
+                f"else echo 'user_dir: ok'; fi; "
+                f"if [ -d {home} ] && [ -w {home} ]; then mkdir -p {root} && df -h {root} | tail -1; else echo '(not checked)'; fi; "
                 "sinfo -h -o '%P|%l|%G|%a' | sort -u")
     lines = out.splitlines()
+    status = lines[2].split(": ", 1)[-1] if len(lines) > 2 else ""
+    if lines and status != "ok":
+        raise NuhpcError(f"user_dir {user_dir(cfg)} is {status} on the cluster: fix user_dir in {CONFIG_PATH}")
     info = {"ssh": "ok" if lines[:1] == ["ok"] else "dry-run" if args.dry_run else "FAILED",
-            "login_node": lines[1] if len(lines) > 1 else "", "remote_root_disk": lines[2] if len(lines) > 2 else "",
+            "login_node": lines[1] if len(lines) > 1 else "", "user_dir": status,
+            "work_root": remote_path(cfg, project=project), "remote_root_disk": lines[3] if len(lines) > 3 else "",
+            **({"projects": {n: pr["dir"] for n, pr in cfg["projects"].items()}} if cfg["projects"] else {}),
             "partitions": [dict(zip(("partition", "timelimit", "gres", "avail"), l.split("|")))
-                           for l in lines[3:] if "|" in l]}
+                           for l in lines[4:] if "|" in l]}
     if args.smoke:
         args.template, args.name, args.param, args.sweep, args.grid = "smoke", "smoke", [], None, None
         args.code, args.max_parallel, args.confirm_big = None, None, False
@@ -626,14 +672,16 @@ def cmd_submit(args, cfg, R, quiet=False, tasks=None):
     max_par = args.max_parallel or lim.get("default_max_parallel")
 
     run_id = f"{slug(args.name or template.stem)}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    run_dir = remote_path(cfg, f"runs/{run_id}")
+    project = getattr(args, "project", None)
+    run_dir = remote_path(cfg, f"runs/{run_id}", project)
     stage = STATE_DIR / "runs" / run_id
     stage.mkdir(parents=True, exist_ok=True)
-    (stage / "job.sbatch").write_text(render(cfg, template, res, n, max_par, run_id, run_dir, slug(args.name or template.stem)))
+    (stage / "job.sbatch").write_text(render(cfg, template, res, n, max_par, run_id, run_dir,
+                                             slug(args.name or template.stem), project))
     (stage / "sweep.jsonl").write_text("".join(json.dumps(t) + "\n" for t in tasks))
     if packs:
         (stage / "packs.json").write_text(json.dumps(packs))
-    meta = {"run_id": run_id, "template": template.stem, "project": getattr(args, "project", None),
+    meta = {"run_id": run_id, "template": template.stem, "project": project,
             "profile": prof, "resources": res, "n_tasks": n,
             "n_rows": len(tasks), "pack_by": keys or None,
             "max_parallel": max_par, "worst_case_gpu_hours": round(gpu_h, 2), "code": args.code,
@@ -901,7 +949,7 @@ def cmd_push(args, cfg, R):
     src = Path(args.local).expanduser().resolve()
     if not src.exists():
         raise NuhpcError(f"not found: {src}")
-    dst = remote_path(cfg, f"data/{args.remote or src.name}")
+    dst = remote_path(cfg, f"data/{args.remote or src.name}", args.project)
     if args.globus:
         return _globus(cfg, R, args, str(src), dst, to_remote=True)
     R.run(f"mkdir -p {shlex.quote(dst if src.is_dir() else str(Path(dst).parent))}")
@@ -910,7 +958,7 @@ def cmd_push(args, cfg, R):
 
 
 def cmd_pull(args, cfg, R):
-    src = remote_path(cfg, args.remote)
+    src = remote_path(cfg, args.remote, args.project)
     dst = Path(args.local or Path(cfg["local_results"]) / "pulled" / Path(args.remote).name).expanduser()
     if args.globus:
         return _globus(cfg, R, args, str(dst.resolve()), src, to_remote=False)
@@ -931,7 +979,7 @@ def _globus(cfg, R, args, local, remote, to_remote):
 
 
 def cmd_ls(args, cfg, R):
-    out = R.run(f"ls -la {shlex.quote(remote_path(cfg, args.path or ''))}")
+    out = R.run(f"ls -la {shlex.quote(remote_path(cfg, args.path or '', args.project))}")
     print(out, end="") if not args.json else emit({"listing": out}, args)
 
 
@@ -973,9 +1021,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub("init", cmd_init, "write an example config to ~/.config/nuhpc/config.toml")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--user-dir", help="your folder on the cluster's project storage, e.g. /projects/<group>/<you>")
     sub("connect", cmd_connect, "open a persistent SSH session (interactive: password/Duo happens here)")
-    p = sub("check", cmd_check, "verify SSH, remote_root, and list partitions; --smoke also submits an env test job")
+    p = sub("check", cmd_check, "verify SSH and user_dir, create the work root, list partitions; --smoke also submits an env test job")
     p.add_argument("--smoke", action="store_true")
+    p.add_argument("--project", help="check this declared project's work root instead of the default")
     add_resource_flags(p)
     sub("templates", cmd_templates, "list job templates")
 
@@ -1035,16 +1085,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--since", default="7d", help="runs submitted within e.g. 48h or 7d (default), or 'all'")
     p.add_argument("--project", help="only runs tagged with this project")
     sub("queue", cmd_queue, "your jobs in the Slurm queue")
-    p = sub("push", cmd_push, "upload data to remote_root/data/")
+    p = sub("push", cmd_push, "upload data to the work root's data/ folder")
     p.add_argument("local")
+    p.add_argument("--project", help="use this declared project's work root")
     p.add_argument("remote", nargs="?", help="destination relative to data/ (default: same name)")
     p.add_argument("--globus", action="store_true")
-    p = sub("pull", cmd_pull, "download a path (relative to remote_root)")
+    p = sub("pull", cmd_pull, "download a path (relative to the work root)")
     p.add_argument("remote")
+    p.add_argument("--project", help="use this declared project's work root")
     p.add_argument("local", nargs="?")
     p.add_argument("--globus", action="store_true")
-    p = sub("ls", cmd_ls, "list a directory under remote_root")
+    p = sub("ls", cmd_ls, "list a directory under the work root")
     p.add_argument("path", nargs="?")
+    p.add_argument("--project", help="use this declared project's work root")
     return ap
 
 

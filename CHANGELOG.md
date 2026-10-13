@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0 (2026-10-13)
+
+- **`user_dir` and project directories.** Installs (`envs/`, `hf_cache/`) live in `user_dir`, your folder on project storage, shared by all your projects. Runs and data live in a `nuhpc/` folder inside `user_dir`, or inside a project directory declared as `[projects.NAME] dir = "..."` and chosen with `--project NAME` on `submit`, `run`, `push`, `pull`, `ls` and `check`. Only declared directories can be used, so an agent cannot write elsewhere.
+- Jobs export `HPC_USER_DIR`; templates get `{{USER_DIR}}`, and `env_build` builds under it. `HPC_REMOTE_ROOT` is now the run's work root.
+- `nuhpc init --user-dir DIR` writes the config with your folder filled in, and a config that still has the placeholder is refused with a message. `nuhpc check` verifies `user_dir` and creates the work root only when `user_dir` exists, so a typo does not create a folder.
+- Configs with only `remote_root` behave exactly as before. With both set, `user_dir` holds the installs and `remote_root` replaces `<user_dir>/nuhpc` as the default work root.
+
 ## 0.2.0 (2026-10-12)
 
 - **Usage accounting.** Every finished run gets a usage record: what it requested beside what Slurm accounted per task, plus GPU utilisation from 30 s `nvidia-smi` samples. Records are kept locally, beside fetched results and in `~/.nuhpc/usage/` on the cluster. `submit`/`run --project` tag runs, and `nuhpc usage` reports per run and per project.

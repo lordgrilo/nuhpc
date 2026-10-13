@@ -1,7 +1,7 @@
 # doc: Build your own Python environment for nuhpc jobs, once (about 20 min on a CPU profile): uv, Python 3.12, torch and vLLM.
-# doc: Optional params: env (default envs/llm, relative to remote_root unless absolute), python (3.12), torch_backend (cu129),
+# doc: Optional params: env (default envs/llm, relative to user_dir unless absolute), python (3.12), torch_backend (cu129),
 # doc: vllm (wheel URL or pip spec, or none), extra (more packages; default "huggingface_hub openai"), bootstrap_python (a python with pip).
-# doc: The example config's env_setup already activates $HPC_REMOTE_ROOT/envs/llm. Then run `nuhpc check --smoke`.
+# doc: The example config's env_setup already activates $HPC_USER_DIR/envs/llm. Then run `nuhpc check --smoke`.
 # env-setup: none
 ENV="$(hpc_param env envs/llm)"
 PYVER="$(hpc_param python 3.12)"
@@ -9,7 +9,7 @@ BACKEND="$(hpc_param torch_backend cu129)"
 VLLM="$(hpc_param vllm https://github.com/vllm-project/vllm/releases/download/v0.31.0/vllm-0.31.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl)"
 EXTRA="$(hpc_param extra "huggingface_hub openai")"
 BOOT="$(hpc_param bootstrap_python /shared/EL9/explorer/anaconda3/2024.06/bin/python3)"
-case "$ENV" in /*) ;; *) ENV="{{REMOTE_ROOT}}/$ENV" ;; esac
+case "$ENV" in /*) ;; *) ENV="{{USER_DIR}}/$ENV" ;; esac
 
 # Project storage costs ~0.1 s per file written: uv's cache stays on local disk, files are copied (no
 # cross-filesystem hardlinks), and bytecode is compiled now (first imports would otherwise write each .pyc).

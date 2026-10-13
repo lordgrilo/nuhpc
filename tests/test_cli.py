@@ -415,3 +415,151 @@ def test_env_build_runs_without_env_setup_and_builds_under_remote_root(tmp_path)
     assert calls[1][-2:] == ["huggingface_hub", "openai"]
     assert [c[0] for c in calls[2:]] == ["pip"]                   # no second venv
     assert "python-ok" in p.stdout and f'source "{venv}/bin/activate"' in p.stdout
+
+
+# ---- user_dir and project directories: where nuhpc installs and where it keeps work ----
+
+LAB = "/projects/lab/me"
+
+
+@pytest.fixture
+def lab_env(tmp_path):
+    """A config in the new style: user_dir plus one declared project; no remote_root."""
+    cfg = tmp_path / "lab.toml"
+    cfg.write_text(f'ssh_host = "nowhere"\nuser_dir = "{LAB}"\nlocal_results = "{tmp_path}/results"\n'
+                   f'[projects.miller]\ndir = "{LAB}/miller"\n')
+    return {**os.environ, "NUHPC_CONFIG": str(cfg), "NUHPC_STATE": str(tmp_path / "state")}
+
+
+@pytest.fixture
+def lab_main(lab_env, monkeypatch):
+    """cli.main in-process against the lab config, with the transport recording instead of running."""
+    monkeypatch.setattr(cli, "CONFIG_PATH", Path(lab_env["NUHPC_CONFIG"]))
+    rec = {"run": [], "rsync": [], "reply": ""}
+    monkeypatch.setattr(cli.Remote, "run", lambda self, cmd, retry=True: rec["run"].append(cmd) or rec["reply"])
+    monkeypatch.setattr(cli.Remote, "rsync", lambda self, src, dst, extra=None: rec["rsync"].append((src, dst)))
+    return rec
+
+
+def job_script(res):
+    return (Path(res["local_stage"]) / "job.sbatch").read_text()
+
+
+def test_default_work_root_is_nested_under_user_dir(lab_env):
+    rc, res = nuhpc(lab_env, "submit", "smoke", "--partition", "short")
+    assert rc == 0 and res["remote_dir"].startswith(f"{LAB}/nuhpc/runs/")
+    job = job_script(res)
+    assert f'export HPC_USER_DIR="{LAB}"' in job and f'export HPC_REMOTE_ROOT="{LAB}/nuhpc"' in job
+    assert f'df -h "{LAB}/nuhpc"' in job                    # {{REMOTE_ROOT}} is the work root
+
+
+def test_declared_project_gets_its_own_nested_work_root(lab_env):
+    rc, res = nuhpc(lab_env, "submit", "smoke", "--partition", "short", "--project", "miller")
+    assert rc == 0 and res["project"] == "miller" and res["remote_dir"].startswith(f"{LAB}/miller/nuhpc/runs/")
+    job = job_script(res)
+    assert f'export HPC_REMOTE_ROOT="{LAB}/miller/nuhpc"' in job
+    assert f'export HPC_USER_DIR="{LAB}"' in job             # installs stay with the user, not the project
+
+
+def test_undeclared_project_is_only_a_tag(lab_env):
+    rc, res = nuhpc(lab_env, "submit", "smoke", "--partition", "short", "--project", "nuhpc-dev")
+    assert rc == 0 and res["project"] == "nuhpc-dev" and res["remote_dir"].startswith(f"{LAB}/nuhpc/runs/")
+
+
+def test_env_build_default_stays_under_user_dir_even_for_a_project(lab_env):
+    rc, res = nuhpc(lab_env, "submit", "env_build", "--partition", "short", "--project", "miller")
+    assert rc == 0
+    assert f'ENV="{LAB}/$ENV"' in job_script(res) and "miller/$ENV" not in job_script(res)
+
+
+def test_remote_root_alone_behaves_as_before(env):
+    """Existing configs: remote_root is the work root, and installs default beside it."""
+    rc, res = nuhpc(env, "submit", "env_build", "--partition", "short")
+    root = res["remote_dir"].split("/runs/")[0]
+    job = job_script(res)
+    assert f'export HPC_USER_DIR="{root}"' in job and f'export HPC_REMOTE_ROOT="{root}"' in job
+    assert f'ENV="{root}/$ENV"' in job
+
+
+def test_remote_root_with_user_dir_overrides_only_the_default_work_root(tmp_path):
+    cfg = tmp_path / "both.toml"
+    cfg.write_text(f'ssh_host = "n"\nuser_dir = "{LAB}"\nremote_root = "{LAB}/nuhpc-old"\n')
+    env = {**os.environ, "NUHPC_CONFIG": str(cfg), "NUHPC_STATE": str(tmp_path / "state")}
+    rc, res = nuhpc(env, "submit", "env_build", "--partition", "short")
+    assert res["remote_dir"].startswith(f"{LAB}/nuhpc-old/runs/") and f'ENV="{LAB}/$ENV"' in job_script(res)
+
+
+def test_push_pull_and_ls_follow_the_project(lab_main, tmp_path):
+    f = tmp_path / "stim.txt"
+    f.write_text("x")
+    cli.main(["--json", "push", str(f), "--project", "miller"])
+    cli.main(["--json", "ls", "sub", "--project", "miller"])
+    cli.main(["--json", "pull", "out/a.json", str(tmp_path / "a.json"), "--project", "miller"])
+    cli.main(["--json", "push", str(f)])
+    assert lab_main["rsync"][0][1] == f"nowhere:{LAB}/miller/nuhpc/data/stim.txt"
+    assert f"ls -la {LAB}/miller/nuhpc/sub" in lab_main["run"][1]         # run[0] is push's mkdir
+    assert lab_main["rsync"][1][0] == f"nowhere:{LAB}/miller/nuhpc/out/a.json"
+    assert lab_main["rsync"][2][1] == f"nowhere:{LAB}/nuhpc/data/stim.txt"       # no project: the default root
+
+
+@pytest.mark.parametrize("body,msg", [
+    ('ssh_host = "n"\n', "user_dir"),
+    ('ssh_host = "n"\nuser_dir = "me/folder"\n', "absolute"),
+    ('ssh_host = "n"\nuser_dir = "/projects/YOUR_GROUP/YOUR_USER"\n', "placeholder"),
+    ('ssh_host = "n"\nremote_root = "/projects/YOUR_GROUP/YOUR_USER/nuhpc"\n', "placeholder"),
+    (f'ssh_host = "n"\nuser_dir = "{LAB}"\n[projects.p]\nnote = "no dir"\n', "projects.p"),
+    (f'ssh_host = "n"\nuser_dir = "{LAB}"\n[projects.p]\ndir = "relative/dir"\n', "projects.p"),
+])
+def test_config_problems_are_named(tmp_path, monkeypatch, body, msg):
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(body)
+    monkeypatch.setattr(cli, "CONFIG_PATH", cfg)
+    with pytest.raises(cli.NuhpcError, match=msg):
+        cli.load_config()
+
+
+def test_init_writes_user_dir_and_the_default_config_asks_to_be_edited(tmp_path):
+    import tomllib
+    cfg = tmp_path / "new" / "config.toml"
+    env = {**os.environ, "NUHPC_CONFIG": str(cfg), "NUHPC_STATE": str(tmp_path / "state")}
+    run = lambda *a: subprocess.run([sys.executable, "-m", "nuhpc", "--json", *a], env=env, capture_output=True, text=True)
+    assert run("init", "--user-dir", f"{LAB}/").returncode == 0
+    text = cfg.read_text()
+    assert tomllib.loads(text)["user_dir"] == LAB
+    assert not [l for l in text.splitlines() if "YOUR_" in l and not l.lstrip().startswith("#")]
+    cfg.unlink()
+    assert run("init").returncode == 0                       # no --user-dir: the placeholder stays...
+    p = run("templates")
+    assert p.returncode == 1 and "placeholder" in json.loads(p.stdout)["error"]   # ...and is refused
+
+
+CHECK_OK = "ok\nlogin01\nuser_dir: ok\nvast:/projects 16T 4.0T 12T 26% /projects\nshort|2-00:00:00|(null)|up\n"
+
+
+def test_check_verifies_user_dir_and_reports_the_work_root(lab_main, capsys):
+    lab_main["reply"] = CHECK_OK
+    cli.main(["--json", "check", "--project", "miller"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["user_dir"] == "ok" and out["work_root"] == f"{LAB}/miller/nuhpc"
+    assert out["projects"] == {"miller": f"{LAB}/miller"} and out["partitions"][0]["partition"] == "short"
+    assert f"mkdir -p {LAB}/miller/nuhpc" in lab_main["run"][0]
+
+
+def test_check_names_a_missing_user_dir(lab_main, capsys):
+    lab_main["reply"] = "ok\nlogin01\nuser_dir: MISSING\n(not checked)\nshort|2-00:00:00|(null)|up\n"
+    with pytest.raises(SystemExit):
+        cli.main(["--json", "check"])
+    err = json.loads(capsys.readouterr().out)["error"]
+    assert "user_dir" in err and LAB in err and "MISSING" in err
+
+
+def test_check_does_not_create_a_missing_user_dir(lab_main, tmp_path):
+    """The remote shell itself, run locally: a typo'd user_dir must not be created as a side effect."""
+    lab_main["reply"] = CHECK_OK
+    cli.main(["--json", "check", "--project", "miller"])
+    cmd = lab_main["run"][0].replace(LAB, str(tmp_path / "typo"))
+    p = subprocess.run(["bash", "-c", cmd.split("; sinfo")[0]], capture_output=True, text=True)
+    assert "user_dir: MISSING" in p.stdout and not (tmp_path / "typo").exists()
+    (tmp_path / "typo").mkdir()
+    p = subprocess.run(["bash", "-c", cmd.split("; sinfo")[0]], capture_output=True, text=True)
+    assert "user_dir: ok" in p.stdout and (tmp_path / "typo/miller/nuhpc").is_dir()
