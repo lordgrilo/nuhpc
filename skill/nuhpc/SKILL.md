@@ -27,6 +27,16 @@ You reach the cluster only through `nuhpc`. Never call `ssh`, `scp`, `rsync` or 
 8. **Collect.** `nuhpc --json fetch <run_id> --include '*.json' --include '*.jsonl' ...` Fetch only what the analysis needs; never fetch checkpoints unless asked.
 9. **Report** the run_ids, what ran, what failed and why, and where the results are locally. Add the compute from `nuhpc --json usage <run_id>...`: GPU-hours used against `req_gpu_h`. If `time_%` or `gpu_util_%` is low, say so and size the next submit from it (a shorter `--time`, a bigger batch, or a smaller GPU).
 
+## Size jobs before you submit
+
+Explorer limits how many jobs one user can run at once, and **every array task counts as a job**: 50 on `short`, 2 on `gpu-short`, 4 on `gpu` (live caps, 2026-10-15). Many tiny tasks therefore queue behind your own cap while the cluster is idle, whereas one wide job starts in about a minute. nuhpc refuses more than 16 array tasks of at most 2 CPUs unless they are packed, and warns from 9.
+
+1. **Pack CPU rows:** `--rows-per-job N` runs N rows side by side in one job. `--cpus` and `--mem` describe ONE row; nuhpc asks Slurm for N times that. Keep a job within a typical node (about 20 CPUs and 60 GB on `short`, roughly 3 GB per CPU): rows of 1 CPU and 6 GB fit as `--rows-per-job 10`. Take each row's memory from a pilot's peak in `nuhpc --json usage` plus 30%, not from a guess.
+2. **`--time` covers the whole job** and is a cap that kills the task: set it to about 1.5 times the slowest measured row times the number of waves (`rows-per-job` divided by `--parallel`, which is 1 wave by default). A timeout loses the work, so make rows write results as they go. Don't ask for far more than needed either: it delays the start.
+3. **Before any submit of more than a few jobs, run `nuhpc --json queue`.** If your jobs are already pending with `QOSMaxJobsPerUserLimit`, the cap is full: submit nothing more, and wait or pack what is queued. `JobArrayTaskLimit` is your own `%N` throttle and needs no action.
+4. **GPUs:** rows share a GPU job only one after another. `gpu-short` runs 2 jobs per user and `gpu` 4, so never launch GPU pilots in parallel: put all conditions for one model in one job, and use `gpu` for batches.
+5. **Read `warnings` in every submit result.** A warning means the shape is wrong (too many tiny tasks, a job bigger than a typical node): fix it, or stop and tell the human. Never use `--confirm-big` to get past a refusal, and never route work through another partition to get around a cap.
+
 ## Normal on Explorer (don't "fix" these)
 
 - GPU jobs sit `PENDING` for minutes to an hour. Never resubmit because of it.

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0 (2026-10-15)
+
+- **CPU packing.** `submit --rows-per-job N [--parallel P]` puts N rows into each job and runs them side by side. `--cpus` and `--mem` describe one row; the job asks for that times P (the submit result shows `per_row_resources`, `resources` and `waves`). Each row gets its own `outputs/task_K/row_R/` folder, and `HPC_OUT` and `HPC_PARAMS` name it inside the row, so scripts need no change. Rows get `OMP_NUM_THREADS` and the other BLAS thread variables set to their CPU count, their output lines are prefixed `[row R]`, and a failing row leaves its exit code in `row_R/exit_code` without stopping the others. GPU jobs run their rows one at a time.
+- The `python` and `cmd` templates now run through `hpc_each_row`, so they support packing; `vllm_eval --pack` is unchanged. Packed rows now run in their own subshell, and every packed row writes `exit_code`.
+- **Submit-time checks.** More than `limits.small_task_max` (default 16) array tasks of at most `small_task_cpus` (2) CPUs and no GPU are refused unless packed or given `--confirm-big`; above `small_task_warn` (8) they warn. The message names the `--rows-per-job` to use. `limits.big_job_cpus` and `big_job_mem` warn when one job is bigger than a typical node. Warnings go to stderr and to `warnings` in the JSON result.
+- Jobs export `HPC_PACK_PARALLEL` and `HPC_ROW_CPUS`.
+- README: a "Sizing jobs on Explorer" section with the live limits, node sizes and rules, and the packing contract. `SKILL.md`: a sizing checklist for agents.
+
 ## 0.3.0 (2026-10-13)
 
 - **`user_dir` and project directories.** Installs (`envs/`, `hf_cache/`) live in `user_dir`, your folder on project storage, shared by all your projects. Runs and data live in a `nuhpc/` folder inside `user_dir`, or inside a project directory declared as `[projects.NAME] dir = "..."` and chosen with `--project NAME` on `submit`, `run`, `push`, `pull`, `ls` and `check`. Only declared directories can be used, so an agent cannot write elsewhere.

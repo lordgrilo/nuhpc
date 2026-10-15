@@ -160,6 +160,8 @@ Locally: the config is `~/.config/nuhpc/config.toml`, the ledger, staged jobs an
 | `Resources` | no free GPU of that type right now | wait, or ask for another type |
 | `Nodes required for job are DOWN, DRAINED or reserved…` | that partition's nodes are taken by a higher-priority partition | resubmit on the other partition (`gpu` ↔ `gpu-short`) |
 | `QOSMaxGRESPerUser`, `AssocGrpGRES…` | you've hit a per-user GPU cap | wait for your own jobs, or use fewer GPUs |
+| `QOSMaxJobsPerUserLimit` | you already have the maximum number of jobs running in that partition (every array task counts) | wait, or [pack rows into fewer jobs](#sizing-jobs-on-explorer); submitting more only lengthens the queue |
+| `JobArrayTaskLimit` | your own `%N` throttle on that array (`--max-parallel`) | wait, or raise the throttle if the caps below allow it |
 
 **Costs.** Every submit reports `worst_case_gpu_hours` (GPUs × nodes × walltime × tasks). Anything above the limits in your config needs `--confirm-big`. Keep `--time` near the real runtime: shorter jobs schedule sooner.
 
@@ -178,6 +180,30 @@ ssh YOUR_NU_USERNAME@login.explorer.northeastern.edu 'cd <work root>/runs && rm 
 ```
 
 There is deliberately no `nuhpc` delete command, so an agent allowed to run `nuhpc` cannot destroy results. Deleting a run folder leaves alone its ledger entry (history), its usage records, its fetched copy in `~/nuhpc-results/`, and any weights it cached in `HF_HOME`; `logs` and `fetch` on that run fail afterwards. The local staging copies in `~/.local/share/nuhpc/runs/` can go at any time. To delete something with thousands of files, such as an old Python environment, do it inside a job with parallel deletes (`find DIR -type f -print0 | xargs -0 -P 16 rm -f`): file operations on `/projects` cost about 0.1 s each. Environments built in the same folder share its `.python` interpreter store (`envs/.python` beside `envs/llm`), so deleting an environment means deleting its own folder only, never `.python`, which the others run from. The `home =` line of each environment's `pyvenv.cfg` names the interpreter it uses; that one can go too once no other environment's `pyvenv.cfg` names it.
+
+## Sizing jobs on Explorer
+
+Most waits and failures on Explorer come from how a submit is shaped, not from the cluster being full. Limits, as the scheduler reported them on 2026-10-15 (`sacctmgr show qos`; per user, per partition) next to what Research Computing [publishes](https://rc.northeastern.edu/partitions/):
+
+| partition | running jobs | queued jobs | GPUs | time (default / max) |
+|---|---|---|---|---|
+| `short` (CPU) | 50 | 1000 | – | 4 h / 48 h; 1024 cores, 25 TB RAM in all |
+| `gpu-short` | 2 | 8 (docs: 4) | 2 (1 per job in the docs) | 1 h / 2 h |
+| `gpu` | 4 | 8 | 4, one per job | 4 h / 8 h |
+| `sharing` | 2 | 4 | 2 | 1 h |
+
+**Every array task counts as a job**, in both the running and the queued column. So 48 one-CPU tasks hold 48 of your 50 `short` slots while using about 5% of your core allowance, and everything else you submit waits behind them. A job also waits for a node that fits it: most `short` nodes have 20 cores and about 62 GB (roughly 3 GB per core), and only about a dozen have more (28 cores with 256 GB, 48 with 126 GB, one with 128 and 512 GB), so a job that asks for more than a typical node can only run on those. And the scheduler's biggest priority term is fair share, computed from your recent use (half-life 7 days), so a heavy burst slows what you submit next.
+
+Rules that follow:
+
+- **Pack small CPU rows into one job** (next section) instead of an array of one-CPU tasks. Size a job to stay within a typical node: about 20 CPUs and 60 GB.
+- **Time is a cap, not a hint.** A task that reaches `--time` is killed and its work is lost, so request about 1.5 times the slowest task you have measured (`nuhpc usage` after a pilot), and write results as you go. Asking for far more only delays the start, and fair share is charged on use.
+- **Memory:** size it from the pilot's peak (`mem_%` in `nuhpc usage`) plus about 30%. Memory over 100% in `nuhpc usage` is Slurm's accounting; a task is only out of memory when it ends `OUT_OF_MEMORY`.
+- **GPUs:** `gpu-short` runs 2 jobs per user and `gpu` 4, so don't launch GPU pilots in parallel. Put all conditions for one model into one job, and use `gpu` for batches.
+- **Idle GPUs are reclaimed.** Research Computing cancels GPU jobs whose compute utilisation stays under 10% for an hour; `sacct` shows `CANCELLED by 0`.
+- **Home** has a 75 GB quota; keep environments and caches on project storage (`nuhpc` builds them there).
+
+nuhpc enforces the first rule. A submit of more than `limits.small_task_max` (default 16) array tasks of at most `small_task_cpus` (2) CPUs and no GPU is refused unless it is packed or given `--confirm-big`, and from `small_task_warn` (8) tasks it warns. `limits.big_job_cpus` and `big_job_mem` (20 and "60G" in the example config) make it warn when one job is bigger than a typical node. Warnings are printed to stderr and listed under `warnings` in the JSON result.
 
 ## Workflows
 
@@ -203,6 +229,27 @@ nuhpc wait scores && nuhpc fetch scores --include '*.jsonl' --include '*.json'
 ```
 
 The worked example is `examples/logprobs.py`. It scores candidate answers by the log-probability of each forced continuation, with all of a prompt's choices in one padded batch and the log-softmax in fp32, and it resumes. A research script built the same way ran 9,556 trials of a 7B VLM in about 15 GPU-minutes. If your script draws text into images, push the font and pass its path as a param: the cluster has no macOS fonts.
+
+### Many small CPU rows: `--rows-per-job`
+
+A sweep of many short or single-CPU rows should not be an array with one task per row (see Sizing jobs). `--rows-per-job N` puts N rows into each job and runs them side by side:
+
+```bash
+# 48 fits, 1 CPU and about 6 GB each, one script per row (rows.jsonl: {"entry": "fit.py", "seed": 0, ...})
+nuhpc submit python --name fits --code . --sweep rows.jsonl --profile cpu --cpus 1 --mem 6G --time 04:00:00 \
+  --rows-per-job 8
+```
+
+This submits 6 jobs, each with 8 CPUs and 48 GB, and each job runs its 8 rows at once. The rules:
+
+- **`--cpus` and `--mem` describe one row.** nuhpc asks Slurm for that times the number of rows run at once, and prints both (`per_row_resources`, `resources`).
+- **`--parallel P` runs only P rows at once** (default: all N). The job then takes `ceil(N / P)` waves, so `--time` is that many row runtimes. `--time` always covers the whole job.
+- **Rows are independent processes.** Your script needs no change: each row runs with its own `--params` and its own folder `outputs/task_K/row_R/`, and `HPC_OUT` and `HPC_PARAMS` point at that folder inside the row, so rows cannot overwrite each other. Rows may differ in `entry` and `args`.
+- **Threads:** `OMP_NUM_THREADS` and the other BLAS thread variables are set to the row's `--cpus`, so a row's numpy does not grab the whole node.
+- **A failing row doesn't stop the others.** Its exit code is left in `row_R/exit_code`, its output lines in the log start with `[row R]`, and the job fails at the end if any row did. Read one row with `nuhpc logs RUN --task K --grep '\[row 3\]'`.
+- **Memory is shared by the job:** a row that exceeds its share can take the whole job down with it, so size `--mem` from measured peaks.
+- **GPU jobs** run their rows one after another (`--parallel` above 1 is refused), which still saves the per-job start; for several models use `--pack` below.
+- It works with the `python` and `cmd` templates, and with any template of your own that runs its work through `hpc_each_row`.
 
 ### vLLM at scale: `vllm_eval --pack`
 
@@ -261,6 +308,8 @@ Global flags: `--json` gives machine-readable output, including errors as `{"err
 --grid key=a,b,c      cartesian product, repeatable; combines with --sweep
 --pack                one array task per group of rows sharing the template's `# pack-by:` keys
                       (vllm_eval: one server per model; the client runs once per row)
+--rows-per-job N      N rows per job, run side by side on CPUs; --cpus/--mem describe ONE row
+--parallel P          with --rows-per-job: rows running at once (default all; 1 on GPU jobs)
 --max-parallel N      array throttle
 --project NAME        tag for usage accounting (nuhpc usage --project NAME); a project declared in the
                       config also selects that project's directory for the run's runs/ and data/
@@ -337,6 +386,8 @@ Every row below happened while setting this up (2026-10-07/09).
 | `wait` prints transport errors, then carries on | laptop asleep, or network changed | normal: it gives up only after 10 failures in a row |
 | `nuhpc usage` shows `mem_%` above 100, with no out-of-memory kill | Slurm's peak-memory figure on Explorer can exceed the request (a model download showed 168 %) | nothing: it is Slurm's number, not a warning |
 | a job pending for a long time | see "Why a job is pending" | — |
+| `submit` refuses: "N array tasks of 1 CPU each would use N of your per-user running-job slots" | an array of tiny tasks holds the per-user running-job cap, and everything else waits behind it | `--rows-per-job` (the message gives a number); see Sizing jobs |
+| tasks end `TIMEOUT` after exactly the `--time` you gave | `--time` is a cap you set, not Explorer's maximum | measure a pilot, request about 1.5 times the slowest task, write results as you go |
 | `status` says `SUBMITTED` | `sacct` hasn't caught up yet | wait a few seconds |
 
 ## On another Slurm cluster
@@ -356,7 +407,7 @@ Everything else, the usage accounting included, reads standard Slurm output.
 - **Every job is a run.** Each run is a frozen snapshot of the rendered sbatch, the parameters, and the code. That makes runs reproducible and easy to inspect: everything lives in `runs/<run_id>/`.
 - **One contract for batch code.** Your script takes `--params <params.json> --out <dir>` and writes what it wants kept into `--out`. Sweeps, evals and training all use this shape. Quick tests (`run`/`cmd`) skip it.
 - **Sweeps are job arrays.** There is one task per row, or per pack, throttled with `%max_parallel`. This is how you run models or configurations in parallel without monopolising the GPU queue.
-- **Guardrails for agents.** Every submit computes its worst-case GPU-hours and task count. Anything above the limits in your config needs `--confirm-big`, and the agent instructions say that flag requires a human.
+- **Guardrails for agents.** Every submit computes its worst-case GPU-hours and task count. Anything above the limits in your config needs `--confirm-big`, and the agent instructions say that flag requires a human. So does a large array of tiny tasks, which would otherwise fill the user's running-job cap; packing is the way out.
 
 ## Known gaps
 

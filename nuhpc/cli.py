@@ -204,6 +204,21 @@ def resolve_resources(cfg: dict, args) -> tuple[str | None, dict]:
     return name, res
 
 
+def mem_to_gb(s) -> float:
+    """A Slurm memory request ('6G', '1500M', '2T'; a bare number is MB) in GB."""
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMGT]?)B?\s*", str(s).upper())
+    if not m:
+        raise NuhpcError(f"can't read memory '{s}': use a number with a unit, like 6G or 1500M")
+    return float(m.group(1)) * 1024.0 ** ("KMGT".index(m.group(2) or "M") - 2)
+
+
+def scale_mem(s, k: int) -> str:
+    m = re.fullmatch(r"\s*(\d+)\s*([KMGT]?)B?\s*", str(s).upper())
+    if not m:
+        raise NuhpcError(f"can't multiply --mem '{s}' by {k} rows: use an integer with a unit, like 6G or 1500M")
+    return f"{int(m.group(1)) * k}{m.group(2)}"
+
+
 def gpus_per_node(res: dict) -> int:
     g = str(res.get("gres", "") or "")
     if not g.startswith("gpu"):
@@ -261,6 +276,43 @@ def pack_rows(tasks: list[dict], keys: list[str]) -> list[list[int]]:
     return list(groups.values())
 
 
+def suggest_rows_per_job(cfg: dict, res: dict, n_rows: int) -> int:
+    """How many one-row jobs fit side by side in a job that stays within a typical node."""
+    lim, k = cfg["limits"], n_rows
+    k = min(k, int(lim.get("big_job_cpus") or 16) // max(1, int(res["cpus"])))
+    if lim.get("big_job_mem"):
+        k = min(k, int(mem_to_gb(lim["big_job_mem"]) // mem_to_gb(res["mem"])))
+    return k
+
+
+def check_job_shape(cfg: dict, res: dict, job_res: dict, n: int, n_rows: int, confirm_big: bool) -> list[str]:
+    """What a submit asks of the scheduler. Many tiny array tasks are refused (they use up the per-user running-job
+    cap, which counts every array task); smaller excesses and jobs bigger than most nodes return warnings."""
+    lim, warnings = cfg["limits"], []
+    cpus, small_max, small_warn = int(job_res["cpus"]), lim.get("small_task_max", 16), lim.get("small_task_warn", 8)
+    if gpus_per_node(job_res) == 0 and cpus <= lim.get("small_task_cpus", 2) and (
+            (small_max and n > small_max) or (small_warn and n > small_warn)):
+        k = suggest_rows_per_job(cfg, res, n_rows)
+        what = (f"{n} array tasks of {cpus} CPU{'s' if cpus > 1 else ''} each would use {n} of your per-user "
+                "running-job slots: the scheduler caps how many jobs one user can run at once, and every array task counts.")
+        fix = (f"Pack them: --rows-per-job {k} runs {k} rows side by side in one job ({k * int(res['cpus'])} CPUs, "
+               f"{scale_mem(res['mem'], k)}), {-(-n_rows // k)} jobs in all, and --time then covers one row's runtime."
+               if k >= 2 else "Rows this large cannot be packed within a typical node: submit fewer at a time.")
+        if small_max and n > small_max:
+            if not confirm_big:
+                raise NuhpcError(f"{what} {fix} Submitting them unpacked needs --confirm-big (human approval).")
+            warnings.append(f"{what} Allowed by --confirm-big. {fix}")
+        else:
+            warnings.append(f"{what} {fix}")
+    bc, bm = lim.get("big_job_cpus"), lim.get("big_job_mem")
+    if (bc and cpus > int(bc)) or (bm and mem_to_gb(job_res["mem"]) > mem_to_gb(bm)):
+        typical = " and ".join(x for x in (f"{bc} CPUs" if bc else "", str(bm) if bm else "") if x)
+        warnings.append(f"each job asks for {cpus} CPUs and {job_res['mem']}, bigger than most nodes (about {typical}): "
+                        "it can only run on the few large nodes, so expect long waits. "
+                        "Use fewer rows per job or less memory per row.")
+    return warnings
+
+
 def all_templates(cfg: dict) -> list[Path]:
     dirs = [Path(str(resources.files("nuhpc") / "templates"))]
     if cfg["templates_dir"]:
@@ -277,6 +329,8 @@ def all_templates(cfg: dict) -> list[Path]:
 PREAMBLE = r'''set -euo pipefail
 export HPC_USER_DIR="{user_dir}"
 export HPC_REMOTE_ROOT="{remote_root}"
+export HPC_PACK_PARALLEL="{parallel}"
+export HPC_ROW_CPUS="{row_cpus}"
 export HPC_RUN_ID="{run_id}"
 export HPC_RUN_DIR="{run_dir}"
 export HPC_TASK_ID="${{SLURM_ARRAY_TASK_ID:-0}}"
@@ -293,19 +347,45 @@ export HPC_ROWS
 sed -n "$((${{HPC_ROWS%% *}} + 1))p" "$HPC_RUN_DIR/sweep.jsonl" > "$HPC_PARAMS"
 
 # hpc_each_row CMD...: run CMD once per row of this task, with HPC_ROW, HPC_ROW_PARAMS, HPC_ROW_OUT set.
-# Unpacked runs keep the flat layout (outputs/task_K); packed rows write to outputs/task_K/row_R.
-# A failing row doesn't stop the others; the task fails at the end if any row did.
+# Unpacked runs keep the flat layout (outputs/task_K). Packed rows (--pack, --rows-per-job) write to
+# outputs/task_K/row_R, and inside the row HPC_OUT and HPC_PARAMS name that row's own folder and params.
+# With --rows-per-job on CPUs, HPC_PACK_PARALLEL rows run at once: their output lines are prefixed "[row R]"
+# and each gets HPC_ROW_CPUS threads. A failing row doesn't stop the others; its exit code is left in
+# row_R/exit_code, and the task fails at the end if any row did.
+_hpc_row() {{
+  local r="$1" rrc=0; shift
+  export HPC_ROW="$r" HPC_ROW_OUT="$HPC_OUT/row_$r" HPC_ROW_PARAMS="$HPC_OUT/row_$r/params.json"
+  export HPC_OUT="$HPC_ROW_OUT" HPC_PARAMS="$HPC_ROW_PARAMS"
+  mkdir -p "$HPC_ROW_OUT"
+  sed -n "$((r + 1))p" "$HPC_RUN_DIR/sweep.jsonl" > "$HPC_ROW_PARAMS"
+  echo "[nuhpc] row $r: $(cat "$HPC_ROW_PARAMS")"
+  "$@" || rrc=$?
+  [ "$rrc" -eq 0 ] || echo "[nuhpc] row $r failed (exit $rrc)"
+  echo "$rrc" > "$HPC_ROW_OUT/exit_code"
+  return "$rrc"
+}}
 hpc_each_row() {{
   if [ ! -f "$HPC_RUN_DIR/packs.json" ]; then
     HPC_ROW="$HPC_TASK_ID" HPC_ROW_PARAMS="$HPC_PARAMS" HPC_ROW_OUT="$HPC_OUT" "$@"; return
   fi
-  local r rc=0
+  local par="${{HPC_PACK_PARALLEL:-1}}" base r p pids="" rc=0
+  base="$(jobs -rp | wc -l)"   # background jobs that aren't rows (a GPU sampler, a server)
   for r in $HPC_ROWS; do
-    export HPC_ROW="$r" HPC_ROW_OUT="$HPC_OUT/row_$r" HPC_ROW_PARAMS="$HPC_OUT/row_$r/params.json"
-    mkdir -p "$HPC_ROW_OUT"
-    sed -n "$((r + 1))p" "$HPC_RUN_DIR/sweep.jsonl" > "$HPC_ROW_PARAMS"
-    echo "[nuhpc] row $r: $(cat "$HPC_ROW_PARAMS")"
-    "$@" || {{ rc=$?; echo "[nuhpc] row $r failed (exit $rc)"; }}
+    if [ "$par" -le 1 ]; then
+      ( _hpc_row "$r" "$@" ) || rc=1
+      continue
+    fi
+    while [ "$(( $(jobs -rp | wc -l) - base ))" -ge "$par" ]; do sleep 0.2; done
+    (
+      export OMP_NUM_THREADS="$HPC_ROW_CPUS" MKL_NUM_THREADS="$HPC_ROW_CPUS"
+      export OPENBLAS_NUM_THREADS="$HPC_ROW_CPUS" NUMEXPR_NUM_THREADS="$HPC_ROW_CPUS"
+      _hpc_row "$r" "$@" || true
+    ) 2>&1 | while IFS= read -r line || [ -n "$line" ]; do echo "[row $r] $line"; done &
+    pids="$pids $!"
+  done
+  for p in $pids; do wait "$p" || true; done
+  for r in $HPC_ROWS; do
+    [ "$par" -le 1 ] || [ "$(cat "$HPC_OUT/row_$r/exit_code" 2>/dev/null || echo 1)" -eq 0 ] || rc=1
   done
   return $rc
 }}
@@ -342,7 +422,8 @@ fi
 
 
 def render(cfg, template: Path, res: dict, n_tasks: int, max_par: int | None,
-           run_id: str, run_dir: str, job_name: str, project: str | None = None) -> str:
+           run_id: str, run_dir: str, job_name: str, project: str | None = None,
+           parallel: int = 1, row_cpus: int | None = None) -> str:
     gpn = gpus_per_node(res)
     hdr = ["#!/bin/bash",
            f"#SBATCH --job-name={job_name}",
@@ -377,7 +458,8 @@ def render(cfg, template: Path, res: dict, n_tasks: int, max_par: int | None,
     env_setup = ("# skipped: this template declares '# env-setup: none'" if "# env-setup: none" in body.splitlines()
                  else cfg["env_setup"].strip())
     pre = PREAMBLE.format(run_id=run_id, run_dir=run_dir, user_dir=user_dir(cfg),
-                          remote_root=remote_path(cfg, project=project), env_setup=env_setup)
+                          remote_root=remote_path(cfg, project=project), env_setup=env_setup,
+                          parallel=parallel, row_cpus=row_cpus or res["cpus"])
     return "\n".join(hdr) + "\n\n" + pre + "\n# ---- template: " + template.stem + " ----\n" + body
 
 
@@ -654,21 +736,54 @@ def cmd_submit(args, cfg, R, quiet=False, tasks=None):
     template = find_template(cfg, args.template)
     if tasks is None:
         tasks = build_tasks(args.sweep, args.grid, parse_kv(args.param))
+    rpj, par = getattr(args, "rows_per_job", None), getattr(args, "parallel", None)
+    if par and not rpj:
+        raise NuhpcError("--parallel needs --rows-per-job (how many rows share a job)")
     keys, packs = [], None
-    if getattr(args, "pack", False):
+    if rpj is not None:
+        body = template.read_text()
+        if getattr(args, "pack", False):
+            raise NuhpcError("--rows-per-job and --pack both group rows; use one (--pack is for templates that share a server)")
+        if rpj < 1:
+            raise NuhpcError("--rows-per-job must be at least 1")
+        if "# pack-by:" in body:
+            raise NuhpcError(f"template '{template.stem}' groups rows by model or server: use --pack, not --rows-per-job")
+        if "hpc_each_row" not in body:
+            raise NuhpcError(f"template '{template.stem}' does not support --rows-per-job (it does not run its work per row)")
+        packs = [list(range(i, min(i + rpj, len(tasks)))) for i in range(0, len(tasks), rpj)]
+    elif getattr(args, "pack", False):
         keys = pack_keys(template)
         if not keys:
             raise NuhpcError(f"template '{template.stem}' does not support --pack (no '# pack-by:' line)")
         packs = pack_rows(tasks, keys)
     n = len(packs) if packs else len(tasks)   # array tasks: what reaches the queue and the limits
     prof, res = resolve_resources(cfg, args)
-    gpu_h = gpus_per_node(res) * int(res["nodes"]) * time_hours(res["time"]) * n
+    job_res, waves = res, None                # res is what one row asks for; job_res is what sbatch gets
+    if rpj:
+        if par is None:
+            par = 1 if gpus_per_node(res) else rpj
+        if par < 1:
+            raise NuhpcError("--parallel must be at least 1")
+        if par > rpj:
+            raise NuhpcError(f"--parallel {par} cannot exceed --rows-per-job {rpj}")
+        if par > 1:
+            if gpus_per_node(res):
+                raise NuhpcError("--parallel above 1 runs rows side by side on CPUs. A GPU job runs its rows one at a "
+                                 "time: drop --parallel, or loop over the rows inside your script.")
+            if int(res["nodes"]) != 1:
+                raise NuhpcError("rows run side by side on one node: use --nodes 1 with --rows-per-job")
+            job_res = {**res, "cpus": int(res["cpus"]) * par, "mem": scale_mem(res["mem"], par)}
+        waves = -(-rpj // par)
+    gpu_h = gpus_per_node(job_res) * int(job_res["nodes"]) * time_hours(job_res["time"]) * n
     lim = cfg["limits"]
     if lim.get("max_tasks") and n > lim["max_tasks"] and not args.confirm_big:
         raise NuhpcError(f"{n} tasks exceeds limits.max_tasks={lim['max_tasks']}. Needs --confirm-big (human approval).")
     if lim.get("max_gpu_hours_per_submit") and gpu_h > lim["max_gpu_hours_per_submit"] and not args.confirm_big:
         raise NuhpcError(f"worst-case {gpu_h:.1f} GPU-hours exceeds limits.max_gpu_hours_per_submit="
                          f"{lim['max_gpu_hours_per_submit']}. Needs --confirm-big (human approval).")
+    warnings = check_job_shape(cfg, res, job_res, n, len(tasks), args.confirm_big)
+    for w in warnings:
+        print(f"[nuhpc] warning: {w}", file=sys.stderr)
     max_par = args.max_parallel or lim.get("default_max_parallel")
 
     run_id = f"{slug(args.name or template.stem)}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
@@ -676,14 +791,16 @@ def cmd_submit(args, cfg, R, quiet=False, tasks=None):
     run_dir = remote_path(cfg, f"runs/{run_id}", project)
     stage = STATE_DIR / "runs" / run_id
     stage.mkdir(parents=True, exist_ok=True)
-    (stage / "job.sbatch").write_text(render(cfg, template, res, n, max_par, run_id, run_dir,
-                                             slug(args.name or template.stem), project))
+    (stage / "job.sbatch").write_text(render(cfg, template, job_res, n, max_par, run_id, run_dir,
+                                             slug(args.name or template.stem), project,
+                                             parallel=par if rpj else 1, row_cpus=int(res["cpus"])))
     (stage / "sweep.jsonl").write_text("".join(json.dumps(t) + "\n" for t in tasks))
     if packs:
         (stage / "packs.json").write_text(json.dumps(packs))
     meta = {"run_id": run_id, "template": template.stem, "project": project,
-            "profile": prof, "resources": res, "n_tasks": n,
+            "profile": prof, "resources": job_res, "n_tasks": n,
             "n_rows": len(tasks), "pack_by": keys or None,
+            "rows_per_job": rpj, "parallel": par if rpj else None,
             "max_parallel": max_par, "worst_case_gpu_hours": round(gpu_h, 2), "code": args.code,
             "created": datetime.now().isoformat(timespec="seconds")}
     (stage / "meta.json").write_text(json.dumps(meta, indent=2))
@@ -703,7 +820,8 @@ def cmd_submit(args, cfg, R, quiet=False, tasks=None):
         R.rsync(f"{code}/", f"{host}:{run_dir}/code/", ex)
     out = R.run(f"cd {shlex.quote(run_dir)} && sbatch --parsable job.sbatch", retry=False)
     job_id = out.strip().split(";")[0] if out.strip() else "DRY-RUN"
-    result = {**meta, "job_id": job_id, "remote_dir": run_dir, "local_stage": str(stage)}
+    result = {**meta, "per_row_resources": res if rpj else None, "waves": waves, "warnings": warnings,
+              "job_id": job_id, "remote_dir": run_dir, "local_stage": str(stage)}
     if not args.dry_run:
         ledger_append({k: result[k] for k in ("run_id", "job_id", "template", "project", "profile", "n_tasks",
                                              "remote_dir", "created", "worst_case_gpu_hours")})
@@ -1042,6 +1160,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pack", action="store_true",
                    help="one array task per group of rows sharing the template's pack-by keys "
                         "(vllm_eval: one server per model, the client runs once per row)")
+    p.add_argument("--rows-per-job", type=int,
+                   help="pack this many rows into each job (array task). CPU rows run side by side: --cpus and "
+                        "--mem then describe ONE row, and the job asks for that times --parallel")
+    p.add_argument("--parallel", type=int,
+                   help="with --rows-per-job: rows running at once (default all of them; 1 on GPU jobs)")
     add_resource_flags(p)
 
     p = sub("run", cmd_run, "quick test: run COMMAND on a compute node (30 min unless --time), wait, "

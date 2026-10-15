@@ -563,3 +563,198 @@ def test_check_does_not_create_a_missing_user_dir(lab_main, tmp_path):
     (tmp_path / "typo").mkdir()
     p = subprocess.run(["bash", "-c", cmd.split("; sinfo")[0]], capture_output=True, text=True)
     assert "user_dir: ok" in p.stdout and (tmp_path / "typo/miller/nuhpc").is_dir()
+
+
+# ---- CPU packing (--rows-per-job) and the small-job checks ----
+
+@pytest.fixture
+def pack_env(tmp_path):
+    """Config with the Explorer-style big-job thresholds; the small-task limits are left at their defaults."""
+    cfg = tmp_path / "pack.toml"
+    cfg.write_text(f'ssh_host = "nowhere"\nremote_root = "{tmp_path}/remote"\nlocal_results = "{tmp_path}/results"\n'
+                   '[limits]\nmax_tasks = 200\nbig_job_cpus = 20\nbig_job_mem = "60G"\n'
+                   '[profiles.cpu]\npartition = "short"\ncpus = 1\nmem = "6G"\ntime = "02:00:00"\n')
+    return {**os.environ, "NUHPC_CONFIG": str(cfg), "NUHPC_STATE": str(tmp_path / "state")}
+
+
+def rows_file(tmp_path, n, **extra):
+    p = tmp_path / "rows.jsonl"
+    p.write_text("".join(json.dumps({"entry": "job.py", "i": i, **extra}) + "\n" for i in range(n)))
+    return str(p)
+
+
+def submit_rows(env, tmp_path, n, *flags, template="python"):
+    return nuhpc(env, "submit", template, "--profile", "cpu", "--sweep", rows_file(tmp_path, n), *flags)
+
+
+def test_rows_per_job_groups_rows_and_multiplies_per_row_resources(tmp_path, pack_env):
+    rc, res = submit_rows(pack_env, tmp_path, 10, "--rows-per-job", "4")
+    assert rc == 0 and res["n_tasks"] == 3 and res["n_rows"] == 10 and res["warnings"] == []
+    assert json.loads((Path(res["local_stage"]) / "packs.json").read_text()) == [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9]]
+    assert (res["rows_per_job"], res["parallel"], res["waves"]) == (4, 4, 1)
+    assert res["per_row_resources"]["cpus"] == 1 and res["per_row_resources"]["mem"] == "6G"
+    assert res["resources"]["cpus"] == 4 and res["resources"]["mem"] == "24G"
+    job = job_script(res)
+    assert "#SBATCH --cpus-per-task=4" in job and "#SBATCH --mem=24G" in job and "#SBATCH --array=0-2" in job
+    assert 'export HPC_PACK_PARALLEL="4"' in job and 'export HPC_ROW_CPUS="1"' in job
+
+
+def test_parallel_below_rows_per_job_runs_in_waves(tmp_path, pack_env):
+    rc, res = submit_rows(pack_env, tmp_path, 8, "--rows-per-job", "8", "--parallel", "4", "--cpus", "2", "--mem", "3G")
+    assert rc == 0 and res["n_tasks"] == 1 and res["waves"] == 2
+    assert res["resources"]["cpus"] == 8 and res["resources"]["mem"] == "12G"     # 4 rows side by side, 2 CPUs each
+    assert 'export HPC_ROW_CPUS="2"' in job_script(res) and 'export HPC_PACK_PARALLEL="4"' in job_script(res)
+
+
+def test_gpu_rows_run_one_at_a_time_and_resources_are_not_multiplied(tmp_path, pack_env):
+    rc, res = submit_rows(pack_env, tmp_path, 6, "--rows-per-job", "3", "--gres", "gpu:1", "--partition", "gpu")
+    assert rc == 0 and res["parallel"] == 1 and res["waves"] == 3
+    assert res["resources"]["cpus"] == 1 and res["resources"]["mem"] == "6G"
+
+
+@pytest.mark.parametrize("flags,msg", [
+    (["--parallel", "2"], "needs --rows-per-job"),
+    (["--rows-per-job", "4", "--pack"], "both group rows"),
+    (["--rows-per-job", "0"], "at least 1"),
+    (["--rows-per-job", "4", "--parallel", "5"], "exceed"),
+    (["--rows-per-job", "4", "--nodes", "2"], "one node"),
+    (["--rows-per-job", "4", "--gres", "gpu:1", "--parallel", "2"], "GPU"),
+    (["--rows-per-job", "4", "--mem", "6.5G"], "integer"),
+])
+def test_rows_per_job_flag_errors_are_named(tmp_path, pack_env, flags, msg):
+    rc, out = submit_rows(pack_env, tmp_path, 8, *flags)
+    assert rc == 1 and msg in out["error"]
+
+
+def test_templates_that_cannot_run_rows_say_so(tmp_path, pack_env):
+    rc, out = submit_rows(pack_env, tmp_path, 4, "--rows-per-job", "2", template="smoke")
+    assert rc == 1 and "does not support --rows-per-job" in out["error"]
+    rc, out = submit_rows(pack_env, tmp_path, 4, "--rows-per-job", "2", template="vllm_eval")
+    assert rc == 1 and "--pack" in out["error"]
+
+
+def run_packed(tmp_path, env, res, task, stubs, **extra_env):
+    """Run one array task of a rendered packed job locally, with stub binaries."""
+    run_dir = Path(res["remote_dir"])
+    if not run_dir.exists():
+        shutil.copytree(res["local_stage"], run_dir)
+        (run_dir / "code").mkdir()
+    path = f"{stub_bin(tmp_path, **stubs)}:{env['PATH']}"
+    p = subprocess.run(["bash", str(run_dir / "job.sbatch")], capture_output=True, text=True, timeout=120,
+                       env={**env, "PATH": path, "SLURM_ARRAY_TASK_ID": str(task), **extra_env})
+    return run_dir, p
+
+
+def row_stub(log_dir):
+    """A python stub: records how many copies run at once, what it saw, and fails for the row named in FAIL_ROW."""
+    return (f'OUT=""; PARAMS=""\n'
+            'while [ $# -gt 0 ]; do case $1 in --params) PARAMS=$2; shift;; --out) OUT=$2; shift;; esac; shift; done\n'
+            f'D="{log_dir}/running"; mkdir -p "$D/$$"; echo "$(ls "$D" | wc -l | tr -d " ")" >> "{log_dir}/concurrency"\n'
+            'echo "$HPC_OUT|${OMP_NUM_THREADS:-}|$(cat "$PARAMS")" > "$OUT/seen"\n'
+            'sleep 0.5\n'
+            'rmdir "$D/$$"\n'
+            '[ "${FAIL_ROW:-}" = "$(basename "$OUT")" ] && exit 7\n'
+            'exit 0')
+
+
+def concurrency(log_dir):
+    return [int(x) for x in (log_dir / "concurrency").read_text().split()]
+
+
+def test_packed_rows_run_side_by_side_each_in_its_own_folder(tmp_path, pack_env):
+    rc, res = submit_rows(pack_env, tmp_path, 6, "--rows-per-job", "6", "--parallel", "3", "--cpus", "2")
+    assert rc == 0
+    log = tmp_path / "log"
+    log.mkdir()
+    run_dir, p = run_packed(tmp_path, pack_env, res, 0, {"python": row_stub(log)})
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert max(concurrency(log)) == 3 and len(concurrency(log)) == 6      # never more than 3 at once; all 6 ran
+    for r in range(6):
+        out, omp, params = (run_dir / f"outputs/task_0/row_{r}/seen").read_text().strip().split("|", 2)
+        assert out == str(run_dir / f"outputs/task_0/row_{r}")             # HPC_OUT is the row's own folder
+        assert omp == "2" and json.loads(params)["i"] == r                 # the row's CPUs as threads; its own params
+        assert (run_dir / f"outputs/task_0/row_{r}/exit_code").read_text().strip() == "0"
+    assert "[row 3] [nuhpc] row 3:" in p.stdout                            # output lines carry the row
+
+
+def test_one_failing_packed_row_fails_the_job_but_not_the_others(tmp_path, pack_env):
+    rc, res = submit_rows(pack_env, tmp_path, 4, "--rows-per-job", "4")
+    log = tmp_path / "log"
+    log.mkdir()
+    run_dir, p = run_packed(tmp_path, pack_env, res, 0, {"python": row_stub(log)}, FAIL_ROW="row_1")
+    assert p.returncode != 0
+    assert (run_dir / "outputs/task_0/row_1/exit_code").read_text().strip() == "7"
+    assert all((run_dir / f"outputs/task_0/row_{r}/seen").exists() for r in range(4))   # the rest still ran
+    assert "[row 1] [nuhpc] row 1 failed (exit 7)" in p.stdout
+
+
+def test_rows_per_job_with_parallel_one_runs_rows_in_order_without_forcing_threads(tmp_path, pack_env):
+    rc, res = submit_rows(pack_env, tmp_path, 3, "--rows-per-job", "3", "--parallel", "1")
+    log = tmp_path / "log"
+    log.mkdir()
+    run_dir, p = run_packed(tmp_path, pack_env, res, 0, {"python": row_stub(log)})
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert concurrency(log) == [1, 1, 1] and res["resources"]["cpus"] == 1
+    assert (run_dir / "outputs/task_0/row_2/seen").read_text().split("|")[1] == ""     # OMP_NUM_THREADS untouched
+
+
+def test_packed_cmd_rows_do_not_overwrite_each_others_hpc_out(tmp_path, pack_env):
+    sweep = tmp_path / "cmds.jsonl"
+    sweep.write_text("".join(json.dumps({"cmd": f'echo row-{i} > "$HPC_OUT/out.txt"'}) + "\n" for i in range(3)))
+    rc, res = nuhpc(pack_env, "submit", "cmd", "--profile", "cpu", "--sweep", str(sweep), "--rows-per-job", "3")
+    assert rc == 0
+    run_dir, p = run_packed(tmp_path, pack_env, res, 0, {})
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert [(run_dir / f"outputs/task_0/row_{i}/out.txt").read_text().strip() for i in range(3)] == ["row-0", "row-1", "row-2"]
+
+
+def test_second_array_task_of_a_packed_run_gets_its_own_rows(tmp_path, pack_env):
+    rc, res = submit_rows(pack_env, tmp_path, 5, "--rows-per-job", "3")
+    log = tmp_path / "log"
+    log.mkdir()
+    run_dir, p = run_packed(tmp_path, pack_env, res, 1, {"python": row_stub(log)})
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert sorted(x.name for x in (run_dir / "outputs/task_1").glob("row_*")) == ["row_3", "row_4"]
+
+
+def test_many_tiny_array_tasks_are_refused_unless_packed(tmp_path, pack_env):
+    rc, out = submit_rows(pack_env, tmp_path, 17)
+    err = out["error"]
+    assert rc == 1 and "17 array tasks" in err and "--confirm-big" in err
+    assert "--rows-per-job 10" in err and "2 jobs" in err         # min(20 cpus // 1, 60G // 6G, 17 rows)
+    rc, res = submit_rows(pack_env, tmp_path, 17, "--confirm-big")
+    assert rc == 0 and any("17 array tasks" in w for w in res["warnings"])
+    rc, res = submit_rows(pack_env, tmp_path, 17, "--rows-per-job", "10")
+    assert rc == 0 and res["n_tasks"] == 2 and res["warnings"] == []
+
+
+def test_a_middling_number_of_tiny_tasks_only_warns(tmp_path, pack_env):
+    assert submit_rows(pack_env, tmp_path, 8)[1]["warnings"] == []
+    rc, res = submit_rows(pack_env, tmp_path, 9)
+    assert rc == 0 and len(res["warnings"]) == 1 and "9 array tasks" in res["warnings"][0]
+    assert "--rows-per-job" in res["warnings"][0]
+
+
+def test_gpu_arrays_and_wide_tasks_are_not_small(tmp_path, pack_env):
+    rc, res = submit_rows(pack_env, tmp_path, 20, "--gres", "gpu:1", "--partition", "gpu")
+    assert rc == 0 and res["warnings"] == []
+    rc, res = submit_rows(pack_env, tmp_path, 20, "--cpus", "8")
+    assert rc == 0 and res["warnings"] == []
+
+
+def test_small_task_checks_can_be_switched_off(tmp_path):
+    cfg = tmp_path / "off.toml"
+    cfg.write_text(f'ssh_host = "n"\nremote_root = "{tmp_path}/r"\n[limits]\nsmall_task_max = 0\nsmall_task_warn = 0\n'
+                   '[profiles.cpu]\npartition = "short"\ncpus = 1\n')
+    env = {**os.environ, "NUHPC_CONFIG": str(cfg), "NUHPC_STATE": str(tmp_path / "state")}
+    rc, res = submit_rows(env, tmp_path, 30)
+    assert rc == 0 and res["warnings"] == []
+
+
+@pytest.mark.parametrize("flags,fragment", [
+    (["--rows-per-job", "8", "--cpus", "4"], "32 CPUs"),
+    (["--rows-per-job", "4", "--mem", "20G"], "80G"),
+])
+def test_jobs_bigger_than_most_nodes_warn(tmp_path, pack_env, flags, fragment):
+    rc, res = submit_rows(pack_env, tmp_path, 8, *flags)
+    assert rc == 0 and any("bigger than most nodes" in w and fragment in w for w in res["warnings"])
