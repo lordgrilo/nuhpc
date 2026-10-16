@@ -203,7 +203,7 @@ Rules that follow:
 - **Idle GPUs are reclaimed.** Research Computing cancels GPU jobs whose compute utilisation stays under 10% for an hour; `sacct` shows `CANCELLED by 0`.
 - **Home** has a 75 GB quota; keep environments and caches on project storage (`nuhpc` builds them there).
 
-nuhpc enforces the first rule. A submit of more than `limits.small_task_max` (default 16) array tasks of at most `small_task_cpus` (2) CPUs and no GPU is refused unless it is packed or given `--confirm-big`, and from `small_task_warn` (8) tasks it warns. `limits.big_job_cpus` and `big_job_mem` (20 and "60G" in the example config) make it warn when one job is bigger than a typical node. Warnings are printed to stderr and listed under `warnings` in the JSON result.
+nuhpc enforces the first rule. A submit of more than `limits.small_task_max` (default 16) array tasks of at most `small_task_cpus` (2) CPUs and no GPU is refused unless it is packed or given `--confirm-big`, and from `small_task_warn` (8) tasks it warns. `limits.big_job_cpus` and `big_job_mem` (20 and "60G" in the example config) make it warn when one CPU job is bigger than a typical CPU node; GPU jobs are not judged by them, as GPU nodes are much bigger. Warnings are printed to stderr and listed under `warnings` in the JSON result.
 
 ## Workflows
 

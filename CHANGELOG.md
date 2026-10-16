@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1 (2026-10-16)
+
+- **Fix:** the "bigger than most nodes" warning (`limits.big_job_cpus` and `big_job_mem`) no longer applies to GPU jobs. Those thresholds describe CPU nodes, so the warning fired on every ordinary GPU job (an A100 job of 12 CPUs and 120 GB, an H200 job of 16 CPUs and 200 GB). The README's wording about fair share now says it belongs to the Slurm account, which a lab shares.
+
 ## 0.4.0 (2026-10-15)
 
 - **CPU packing.** `submit --rows-per-job N [--parallel P]` puts N rows into each job and runs them side by side. `--cpus` and `--mem` describe one row; the job asks for that times P (the submit result shows `per_row_resources`, `resources` and `waves`). Each row gets its own `outputs/task_K/row_R/` folder, and `HPC_OUT` and `HPC_PARAMS` name it inside the row, so scripts need no change. Rows get `OMP_NUM_THREADS` and the other BLAS thread variables set to their CPU count, their output lines are prefixed `[row R]`, and a failing row leaves its exit code in `row_R/exit_code` without stopping the others. GPU jobs run their rows one at a time.

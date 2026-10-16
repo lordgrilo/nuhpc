@@ -36,8 +36,8 @@ fetch_max_file_size = "1G"       # fetch skips bigger files (checkpoints) unless
 small_task_max = 16              # refuse more array tasks than this of <= small_task_cpus CPUs (no GPU) unless packed
 small_task_warn = 8              # ... and warn above this many. Every array task counts against the per-user
 small_task_cpus = 2              # running-job cap (Explorer: 50 on short). 0 switches the check off.
-big_job_cpus = 20                # warn when ONE job asks for more than a typical node has: on Explorer's short
-big_job_mem = "60G"              # partition most nodes are 20 cores with about 62 GB
+big_job_cpus = 20                # warn when ONE CPU job asks for more than a typical node has: on Explorer's short
+big_job_mem = "60G"              # partition most nodes are 20 cores with about 62 GB (GPU jobs are not checked)
 
 # Profiles. Seen with `nuhpc check` on 2026-10-07: gpu (8h max; a100, h200, t4, v100 types),
 # gpu-short / gpu-interactive (2h), short (CPU, default, 2 days). Re-check: access varies by account.

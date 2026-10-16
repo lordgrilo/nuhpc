@@ -1,6 +1,6 @@
 [project]
 name = "nuhpc"
-version = "0.4.0"
+version = "0.4.1"
 description = "Agent-friendly CLI for Slurm jobs on Northeastern's Explorer cluster"
 requires-python = ">=3.11"
 license = "MIT"

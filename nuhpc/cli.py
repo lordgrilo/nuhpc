@@ -304,8 +304,8 @@ def check_job_shape(cfg: dict, res: dict, job_res: dict, n: int, n_rows: int, co
             warnings.append(f"{what} Allowed by --confirm-big. {fix}")
         else:
             warnings.append(f"{what} {fix}")
-    bc, bm = lim.get("big_job_cpus"), lim.get("big_job_mem")
-    if (bc and cpus > int(bc)) or (bm and mem_to_gb(job_res["mem"]) > mem_to_gb(bm)):
+    bc, bm = lim.get("big_job_cpus"), lim.get("big_job_mem")   # CPU-node sizes: GPU nodes are far bigger, so GPU jobs skip this
+    if gpus_per_node(job_res) == 0 and ((bc and cpus > int(bc)) or (bm and mem_to_gb(job_res["mem"]) > mem_to_gb(bm))):
         typical = " and ".join(x for x in (f"{bc} CPUs" if bc else "", str(bm) if bm else "") if x)
         warnings.append(f"each job asks for {cpus} CPUs and {job_res['mem']}, bigger than most nodes (about {typical}): "
                         "it can only run on the few large nodes, so expect long waits. "

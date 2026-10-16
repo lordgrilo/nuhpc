@@ -758,3 +758,11 @@ def test_small_task_checks_can_be_switched_off(tmp_path):
 def test_jobs_bigger_than_most_nodes_warn(tmp_path, pack_env, flags, fragment):
     rc, res = submit_rows(pack_env, tmp_path, 8, *flags)
     assert rc == 0 and any("bigger than most nodes" in w and fragment in w for w in res["warnings"])
+
+
+def test_gpu_jobs_are_never_judged_against_cpu_node_sizes(tmp_path, pack_env):
+    """big_job_cpus/big_job_mem describe the CPU nodes; GPU nodes are far bigger, and a standard A100 or H200 job
+    (12 CPUs and 120G, or 16 and 200G) is normal there."""
+    for cpus, mem, gres in (("12", "120G", "gpu:a100:1"), ("16", "200G", "gpu:h200:1")):
+        rc, res = submit_rows(pack_env, tmp_path, 1, "--cpus", cpus, "--mem", mem, "--gres", gres, "--partition", "gpu-short")
+        assert rc == 0 and res["warnings"] == [], (cpus, mem, res["warnings"])
