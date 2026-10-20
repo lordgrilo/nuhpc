@@ -33,9 +33,31 @@ Explorer limits how many jobs one user can run at once, and **every array task c
 
 1. **Pack CPU rows:** `--rows-per-job N` runs N rows side by side in one job. `--cpus` and `--mem` describe ONE row; nuhpc asks Slurm for N times that. Keep a job within a typical node (about 20 CPUs and 60 GB on `short`, roughly 3 GB per CPU): rows of 1 CPU and 6 GB fit as `--rows-per-job 10`. Take each row's memory from a pilot's peak in `nuhpc --json usage` plus 30%, not from a guess.
 2. **`--time` covers the whole job** and is a cap that kills the task: set it to about 1.5 times the slowest measured row times the number of waves (`rows-per-job` divided by `--parallel`, which is 1 wave by default). A timeout loses the work, so make rows write results as they go. Don't ask for far more than needed either: it delays the start.
-3. **Before any submit of more than a few jobs, run `nuhpc --json queue`.** If your jobs are already pending with `QOSMaxJobsPerUserLimit`, the cap is full: submit nothing more, and wait or pack what is queued. `JobArrayTaskLimit` is your own `%N` throttle and needs no action.
+3. **Before any submit of more than a few jobs, run `nuhpc --json standing`** (one read-only call, about 15 s). If `queue.label` is `POOR`, a cap is holding your jobs back (`QOSMaxJobsPerUserLimit`): submit nothing more, and wait or pack what is queued; `nuhpc --json queue` lists the jobs. `JobArrayTaskLimit` is your own `%N` throttle and needs no action. Then read `advice`, as the next section says: a poor standing changes how you submit.
 4. **GPUs:** rows share a GPU job only one after another. `gpu-short` runs 2 jobs per user and `gpu` 4, so never launch GPU pilots in parallel: put all conditions for one model in one job, and use `gpu` for batches.
 5. **Read `warnings` in every submit result.** A warning means the shape is wrong (too many tiny tasks, a job bigger than a typical node): fix it, or stop and tell the human. Never use `--confirm-big` to get past a refusal, and never route work through another partition to get around a cap.
+
+## When standing is poor: bundle and cut waste, then ask
+
+`nuhpc --json standing` returns three things to act on:
+
+- `advice`: a list of `{code, kind, text}`. Kind `plan` (`caps`, `fairshare`, `busy_queue`) means how you use the cluster has to change. Kind `note` (`gpu_full`) only affects which GPU type to ask for.
+- `cluster.partitions[]`: how busy each queue is for everyone (`label`, `median_wait_min`, `waiting`, free `gpus` by type). It describes the cluster, not you, and never changes `overall`.
+- `overall` and `fairshare.label`, which describe your account.
+
+**Trigger:** `overall` is not `GOOD`, or any `advice` entry has `kind: "plan"`. Before you submit anything beyond a pilot or a handful of jobs:
+
+1. **Measure the waste.** Run `nuhpc --json usage --since 7d`. In `totals`, read the `all` row and the row of the project you are working for: `cpu_idle_%` (core-hours that sat idle, CPU-only tasks), `gpu_idle_%` (GPU-hours that sat idle) and `failed_%` (billed hours spent on tasks that did not complete). Poor means `cpu_idle_%` above 25, `gpu_idle_%` above 50, or `failed_%` above 5. The per-run rows in `runs` (`cpu_idle_%`, `gpu_util_%`, `time_%`, `mem_%`) show which runs did it; name the worst by `cpu_h` times `cpu_idle_%`.
+2. **Write a short cost plan** for the human. Name the actual runs, and for each poor marker give the fix:
+   - `cpu_idle_%` high: ask for the cores the work kept busy (CPUs requested times `1 - cpu_idle_%/100`), measured by a pilot, and bundle small tasks with `--rows-per-job` so one wide job replaces many narrow ones.
+   - `gpu_idle_%` high: one task per model with every condition looped inside it, a bigger batch, a smaller GPU type, or a shorter `--time`.
+   - `failed_%` high: pilot first, `--time` at about 1.5 times the slowest measured task, memory at the pilot's peak plus 30%, rows that write as they go, and resubmit only the failed rows.
+   - `caps`: pack rows; do not add jobs. `busy_queue`: expect the stated wait, ask for a shorter `--time` so the job can backfill, and never cancel and resubmit a job that is only waiting.
+   Give the saving as hours: idle core-hours (`cpu_h` times `cpu_idle_%`) and idle GPU-hours at about 100 core-hours each. That weight is an estimate; say so.
+3. **Ask before the heavy submit.** A pilot or a handful of jobs may go ahead. Anything larger waits until the human accepts the plan or says to go anyway. A poor fair share never blocks a submit by itself; the plan is what makes the human's call informed.
+4. **Report against the plan.** After the run, check `nuhpc --json usage <run_id>` and say whether the idle and failed shares fell.
+
+Do not propose these, because they do not lower the bill: bundling jobs to save billing (packing changes queue waits and the job cap, not the hours billed; only fewer idle or lost hours do), submitting at quiet times (fair share ignores when a job runs), moving work to another partition to get round a cap, or cancelling and resubmitting a queued job. If `gpu_full` says the type you need has no free card, the job will wait and that is normal; ask the human before switching GPU type to chase free cards, because it changes cost and may change results.
 
 ## Normal on Explorer (don't "fix" these)
 
@@ -48,6 +70,7 @@ Explorer limits how many jobs one user can run at once, and **every array task c
 ## Hard rules
 
 - **Never pass `--confirm-big`.** If a submit is rejected by limits, stop and ask the human, giving the worst-case GPU-hours and task count. Alternatively, shrink the job (fewer tasks, shorter `--time`, smaller GPU) when that still answers the question.
+- **No heavy submit while `advice` holds a `plan` entry** (`caps`, `fairshare`, `busy_queue`) until the human has accepted your cost plan (see "When standing is poor"). Pilots and a handful of jobs are fine.
 - **Use `a100x1` or `h200x1`**, adding `--partition gpu-short` (≤ 2 h, starts sooner) for pilots. Don't use `gpu1`: it can land on a 16 GB T4, or a V100 that this environment hasn't been tested on. Ask before multi-GPU: the `multigpu` partition needs RC access.
 - Request `--time` near the realistic runtime plus margin, not the partition maximum. For `vllm_eval`, that is up to 20 minutes of server startup plus the client's runtime for every row of a pack; 45 minutes covers a small pilot. Use `--max-parallel` so you don't flood the shared queue.
 - Weights must already be cached (`hf_download`). Gated models (Llama, Gemma) need an `HF_TOKEN`; ask the human.

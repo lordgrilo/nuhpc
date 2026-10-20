@@ -39,6 +39,15 @@ small_task_cpus = 2              # running-job cap (Explorer: 50 on short). 0 sw
 big_job_cpus = 20                # warn when ONE CPU job asks for more than a typical node has: on Explorer's short
 big_job_mem = "60G"              # partition most nodes are 20 cores with about 62 GB (GPU jobs are not checked)
 
+# [standing]                     # optional cut-offs for `nuhpc standing` (the values below are the defaults)
+# wait_hours = 6                 # queue is OK, not GOOD, once a job has waited this long
+# near_cap = 0.8                 # ... or once you use this fraction of a partition's running-job cap
+# fairshare_good = 0.5           # fair-share factor (0 to 1) for GOOD
+# fairshare_low = 0.25           # below this it is POOR
+# wait_window_h = 6              # the cluster section judges the waits of jobs that started in this many hours
+# cluster_wait_ok_min = 30       # a queue's median wait: under this is GOOD,
+# cluster_wait_poor_min = 120    # under this OK, and this or more POOR
+
 # Profiles. Seen with `nuhpc check` on 2026-10-07: gpu (8h max; a100, h200, t4, v100 types),
 # gpu-short / gpu-interactive (2h), short (CPU, default, 2 days). Re-check: access varies by account.
 [profiles.cpu]

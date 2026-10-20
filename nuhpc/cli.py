@@ -13,11 +13,15 @@ import argparse
 import csv
 import itertools
 import json
+import math
 import os
 import re
 import shlex
+import shutil
+import statistics
 import subprocess
 import sys
+import textwrap
 import time
 import tomllib
 from datetime import datetime, timedelta
@@ -70,6 +74,7 @@ def load_config() -> dict:
     cfg.setdefault("templates_dir", "")
     cfg.setdefault("globus", {})
     cfg.setdefault("projects", {})
+    cfg.setdefault("standing", {})
     for name, proj in cfg["projects"].items():
         if not (isinstance(proj, dict) and str(proj.get("dir", "")).startswith("/")):
             raise NuhpcError(f"[projects.{name}] needs dir = an absolute path on the cluster")
@@ -660,6 +665,473 @@ def ensure_usage(cfg: dict, R, entries: list[dict]) -> dict[str, dict]:
     return recs
 
 
+# --------------------------------------------------------------------------- standing
+
+STANDING_MARK = "__nuhpc_standing__"
+RANK = {"GOOD": 0, "OK": 1, "POOR": 2}
+CAP_REASONS = ("QOSMax", "AssocMax", "AssocGrp")   # a limit blocks the job; JobArrayTaskLimit is your own %N throttle
+STANDING_DEFAULTS = {"wait_hours": 6, "near_cap": 0.8, "fairshare_good": 0.5, "fairshare_low": 0.25,
+                     "wait_window_h": 6, "cluster_wait_ok_min": 30, "cluster_wait_poor_min": 120}
+MIN_STARTS = 5                 # a queue's median wait needs at least this many jobs that started inside the window
+RUN_STATES = ("RUNNING", "COMPLETING", "CONFIGURING")
+WAITING = ("Priority", "Resources")   # pending on the scheduler's account; any other reason (dependency, hold, cap, start time) is held
+DOWN = ("down", "drain", "drng", "inval", "maint", "resv", "reserved", "fail", "unk", "future")   # node states that are not capacity
+
+
+def standing_thresholds(cfg: dict) -> dict:
+    return {**STANDING_DEFAULTS, **cfg.get("standing", {})}
+
+
+def fmt_dur(minutes: float) -> str:
+    """A wait in the unit that fits: minutes under an hour, hours under two days, else days."""
+    if minutes < 60:
+        return f"{minutes:.0f} min"
+    return f"{minutes / 60:.3g} h" if minutes < 2880 else f"{minutes / 1440:.3g} d"
+
+
+def fmt_limit(hours: float) -> str:
+    return f"{hours:g} h" if hours < 24 else f"{hours / 24:g} d"
+
+
+def _hours(t):
+    try:
+        return time_hours(t)
+    except (ValueError, TypeError):
+        return None                                       # UNLIMITED, N/A or absent
+
+
+def _try_time(text):
+    try:
+        return datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None                                       # "Unknown" while a job has no eligible or start time
+
+
+def _gres(text: str) -> dict:
+    """GPUs by type from a Slurm gres string such as gpu:a100:4(S:0-1) or gpu:a100:3(IDX:0-2),gpu:t4:2."""
+    out = {}
+    for item in re.sub(r"\([^)]*\)", "", text).split(","):
+        p = item.split(":")
+        if p[0] == "gpu" and p[-1].isdigit():
+            t = p[1] if len(p) == 3 else "gpu"
+            out[t] = out.get(t, 0) + int(p[-1])
+    return out
+
+
+def standing_query(window_h: float = 6) -> str:
+    """Remote shell, one login-node call: who I am, the cluster clock, the per-partition caps, my queue, the fair-share
+    tree, the priority of my pending jobs, the scheduler weights, and the cluster's own load (cores, GPUs, everyone's
+    queue, and when recent jobs started). Read-only, and it never fails as a whole: a section the cluster won't give
+    simply comes back empty."""
+    m = STANDING_MARK
+    mins = int(round(window_h * 60))
+    return "; ".join([
+        f'echo "{m} me"; echo "$USER"; sacctmgr -nP show assoc where user=$USER format=Account 2>/dev/null | head -1',
+        f'echo "{m} now"; date +%Y-%m-%dT%H:%M:%S',
+        f'echo "{m} qos"; sacctmgr -nP show qos format=Name,MaxJobsPU,MaxSubmitPU 2>/dev/null',
+        f'echo "{m} part"; scontrol show partition -o 2>/dev/null | '
+        "awk '{for (i = 1; i <= NF; i++) if ($i ~ /^(PartitionName|QoS|MaxTime)=/) printf \"%s \", $i; print \"\"}'",
+        f'echo "{m} queue"; squeue --me -h -o "%P|%T|%r|%V|%i|%j" 2>/dev/null',
+        f'echo "{m} share"; sshare -a -n -P -o Account,User,RawShares,NormShares,RawUsage,NormUsage,EffectvUsage,'
+        'FairShare,LevelFS 2>/dev/null',
+        f'echo "{m} prio"; sprio -h -u $USER -o "%i %Y %A %F %J %Q" 2>/dev/null',
+        f'echo "{m} config"; scontrol show config 2>/dev/null | grep -E "^(PriorityDecayHalfLife|PriorityWeight[A-Za-z]*) "',
+        # the cluster itself: cores allocated/idle per queue, GPUs per node, everyone's jobs (counted, never named),
+        # and when the jobs that started in the window had been waiting
+        f'echo "{m} cores"; sinfo -h -o "%R|%C" 2>/dev/null',
+        f'echo "{m} gpus"; sinfo -h -N -O "Partition:24,NodeList:16,StateLong:16,Gres:48,GresUsed:64" 2>/dev/null',
+        f'echo "{m} cqueue"; squeue -h -a -o "%P|%T|%r|%V|%i|%u" 2>/dev/null',
+        f'echo "{m} waits"; sacct -a -X -n -P -S now-{mins}minutes -E now -s R,CD,F,TO '
+        "-o Partition,Submit,Eligible,Start 2>/dev/null",
+        "true"])
+
+
+def _num(x):
+    try:
+        return float(str(x).strip())
+    except ValueError:
+        return None
+
+
+def parse_standing(out: str, cfg: dict, users: bool = False) -> dict:
+    """The queue's pressure against the live caps, and the account's fair-share standing, each with a label
+    (GOOD, OK, POOR) and an overall verdict. Colleagues are named only with users=True."""
+    sec, cur = {}, None
+    for line in out.splitlines():
+        if line.startswith(STANDING_MARK + " "):
+            cur = line[len(STANDING_MARK) + 1:].strip()
+            sec[cur] = []
+        elif cur and line.strip():
+            sec[cur].append(line.rstrip())
+    th = standing_thresholds(cfg)
+    me = sec.get("me", [])
+    user, account = (me[0].strip() if me else ""), (me[1].strip() if len(me) > 1 else "")
+    try:
+        now = datetime.fromisoformat(sec["now"][0].strip())
+    except (KeyError, IndexError, ValueError):
+        now = None
+
+    # ---- queue
+    caps = {}
+    for line in sec.get("qos", []):
+        f = line.split("|")
+        if len(f) >= 3:
+            caps[f[0]] = {"max_jobs": int(f[1]) if f[1].isdigit() else None, "max_submit": int(f[2]) if f[2].isdigit() else None}
+    part_qos, part_limit = {}, {}
+    for line in sec.get("part", []):
+        d = dict(kv.split("=", 1) for kv in line.split() if "=" in kv)
+        if d.get("PartitionName"):
+            part_qos[d["PartitionName"]] = None if d.get("QoS") in (None, "N/A") else d["QoS"]
+            part_limit[d["PartitionName"]] = _hours(d.get("MaxTime"))
+    parts, waiting_long = {}, 0
+    for name in part_qos:                    # every queue is listed, the idle ones too
+        parts[name] = {"partition": name, "running": 0, "pending": 0, "reasons": {}, "oldest_wait_h": None}
+    for line in sec.get("queue", []):
+        f = line.split("|")
+        if len(f) < 6:
+            continue
+        names, state, reason, submit, jobid = f[0].split(","), f[1], f[2].strip().strip("()"), f[3], f[4]
+        age = None
+        if state == "PENDING":
+            try:
+                age = (now - datetime.fromisoformat(submit)).total_seconds() / 3600
+            except (TypeError, ValueError):
+                pass
+            waiting_long += age is not None and age >= th["wait_hours"]
+        for part in names:                    # a job submitted to several queues waits in each of them
+            q = parts.setdefault(part, {"partition": part, "running": 0, "pending": 0, "reasons": {}, "oldest_wait_h": None})
+            if state in RUN_STATES:
+                q["running"] += 1
+            elif state == "PENDING":
+                n = array_count(jobid)
+                q["pending"] += n
+                q["reasons"][reason] = q["reasons"].get(reason, 0) + n
+                if age is not None:
+                    q["oldest_wait_h"] = round(max(age, q["oldest_wait_h"] or 0), 1)
+    blocked = 0
+    near = []
+    for q in parts.values():
+        lim = caps.get(part_qos.get(q["partition"]) or q["partition"], {})
+        q["cap"], q["submit_cap"], q["limit_h"] = lim.get("max_jobs"), lim.get("max_submit"), part_limit.get(q["partition"])
+        blocked += sum(n for r, n in q["reasons"].items() if r.startswith(CAP_REASONS))
+        if q["cap"] and q["running"] >= th["near_cap"] * q["cap"]:
+            near.append(f"{q['partition']} {q['running']}/{q['cap']}")
+    if "queue" not in sec:       # no section at all: the query failed (an empty section means no jobs)
+        qlabel, qnote = "unknown", "queue unavailable"
+    elif blocked:
+        qlabel, qnote = "POOR", f"{blocked} job{'s' if blocked > 1 else ''} held back by a cap"
+    elif near or waiting_long:
+        qlabel = "OK"
+        qnote = ", ".join(([f"near the running-job cap: {', '.join(near)}"] if near else [])
+                          + ([f"{waiting_long} waiting over {th['wait_hours']:g} h"] if waiting_long else []))
+    else:
+        qlabel, qnote = "GOOD", "no cap pressure"
+    queue = {"label": qlabel, "note": qnote, "blocked_by_caps": blocked, "waiting_long": int(waiting_long),
+             "wait_hours": th["wait_hours"], "partitions": sorted(parts.values(), key=lambda q: q["partition"])}
+
+    # ---- fair share
+    conf = {k.strip(): v.strip() for k, v in (l.split("=", 1) for l in sec.get("config", []) if "=" in l)}
+    weights = {k[len("PriorityWeight"):].lower(): int(v) for k, v in conf.items() if k.startswith("PriorityWeight") and v.isdigit()}
+    half = time_hours(conf["PriorityDecayHalfLife"]) / 24 if "PriorityDecayHalfLife" in conf else None
+    rows = [l.split("|") for l in sec.get("share", []) if l.count("|") >= 8]
+    if not account:
+        account = next((r[0].strip() for r in rows if r[1] == user), "")
+    accts = [r for r in rows if r[1] == "" and r[0].strip() not in ("", "root")]
+    mine_a = next((r for r in accts if r[0].strip() == account), None)
+    members = [r for r in rows if r[0].strip() == account and r[1] != ""]
+    mine_u = next((r for r in members if r[1] == user), None)
+    prio = [r for r in (l.split() for l in sec.get("prio", [])) if len(r) >= 6 and r[1].isdigit()]
+    fair = {"label": "unknown"}
+    if mine_a and mine_u:
+        share, eff, level, factor = _num(mine_a[3]), _num(mine_a[6]), _num(mine_a[8]), _num(mine_u[7])
+        total_usage = sum(_num(r[4]) or 0 for r in members)
+        mine_usage = _num(mine_u[4]) or 0
+        label = ("unknown" if factor is None else "GOOD" if factor >= th["fairshare_good"]
+                 else "OK" if factor >= th["fairshare_low"] else "POOR")
+        fair = {"label": label, "factor": factor, "level": level,
+                "thresholds": {"good": th["fairshare_good"], "low": th["fairshare_low"]},
+                "ratio": eff / share if share and eff is not None else None,
+                "accounts_above": sum(1 for r in accts if (_num(r[6]) or 0) > (eff or 0)), "accounts_total": len(accts),
+                "account_usage": _num(mine_a[4]), "n_users": len(members),
+                "your_usage_pct": 100 * mine_usage / total_usage if total_usage else 0.0,
+                "others_pct": 100 - 100 * mine_usage / total_usage if total_usage else 0.0,
+                "half_life_days": half, "weights": weights,
+                "max_fairshare_points": weights.get("fairshare"),
+                "fairshare_points": round(factor * weights["fairshare"]) if factor is not None and "fairshare" in weights else None,
+                "max_priority": sum(weights.get(k, 0) for k in ("age", "fairshare", "jobsize", "partition", "qos")) or None,
+                "recovery_days": half * math.log2(1 / level) if half and level and 0 < level < 1 else None,
+                "priority": ({k: round(sum(float(r[i]) for r in prio) / len(prio))
+                              for k, i in (("priority", 1), ("age", 2), ("fairshare", 3), ("jobsize", 4), ("qos", 5))}
+                             if prio else None)}
+        if users:
+            fair["users"] = [{"user": r[1], "usage_pct": round(100 * (_num(r[4]) or 0) / total_usage, 1) if total_usage else 0.0,
+                              "factor": _num(r[7])} for r in sorted(members, key=lambda r: -(_num(r[4]) or 0))]
+
+    # ---- cluster: everyone's load on each queue you can use (other people's jobs are counted, never named)
+    cl = {}
+    for name in list(part_qos) or [l.split("|")[0].strip() for l in sec.get("cores", [])]:
+        cl[name.rstrip("*")] = {"partition": name.rstrip("*"), "running": 0, "waiting": 0, "held": 0, "oldest_waiting_h": None,
+                                "started": 0, "median_wait_min": None, "p90_wait_min": None, "cores_busy_pct": None, "gpus": {}}
+    users = set()
+    for line in sec.get("cqueue", []):
+        f = line.split("|")
+        if len(f) < 6:
+            continue
+        users.add(f[5].strip())
+        state, reason, n = f[1], f[2].strip().strip("()"), array_count(f[4])
+        waits_on_scheduler = reason in WAITING or reason.startswith("Nodes required")
+        age = None
+        if state == "PENDING" and waits_on_scheduler:
+            try:
+                age = (now - datetime.fromisoformat(f[3])).total_seconds() / 3600
+            except (TypeError, ValueError):
+                pass
+        for name in f[0].split(","):
+            p = cl.get(name.strip().rstrip("*"))
+            if p is None:                      # a queue you can't use
+                continue
+            if state in RUN_STATES:
+                p["running"] += 1
+            elif state == "PENDING":
+                p["waiting" if waits_on_scheduler else "held"] += n
+                if age is not None:
+                    p["oldest_waiting_h"] = round(max(age, p["oldest_waiting_h"] or 0), 1)
+    starts = {}
+    for line in sec.get("waits", []):          # Partition|Submit|Eligible|Start; only starts inside the window say how long jobs wait now
+        f = line.split("|")
+        try:
+            start = datetime.fromisoformat(f[3])
+            if now is None or start < now - timedelta(hours=th["wait_window_h"]):
+                continue
+        except (IndexError, ValueError):
+            continue                           # no start time yet: still pending
+        ready = next((t for t in (_try_time(f[2]), _try_time(f[1])) if t), None)     # when it became eligible, else when it was submitted
+        if ready:
+            starts.setdefault(f[0].strip().rstrip("*"), []).append(max((start - ready).total_seconds() / 60, 0))
+    for name, v in starts.items():
+        if name in cl:
+            v.sort()
+            cl[name]["started"] = len(v)
+            if len(v) >= MIN_STARTS:
+                cl[name]["median_wait_min"], cl[name]["p90_wait_min"] = statistics.median(v), v[int(0.9 * (len(v) - 1))]
+    for line in sec.get("cores", []):          # allocated/idle/other/total: cores on down or drained nodes ("other") are not capacity
+        name, _, c = line.partition("|")
+        try:
+            alloc, idle = (int(x) for x in c.split("/")[:2])
+        except ValueError:
+            continue
+        if name.strip().rstrip("*") in cl:
+            cl[name.strip().rstrip("*")]["cores_busy_pct"] = 100 * alloc / (alloc + idle) if alloc + idle else None
+    for line in sec.get("gpus", []):           # Partition NodeList State Gres GresUsed, one line per node and queue
+        f = line.split()
+        if len(f) < 5 or f[2].lower().startswith(DOWN) or f[0].rstrip("*") not in cl:
+            continue
+        used = _gres(f[4])
+        for t, n in _gres(f[3]).items():
+            g = cl[f[0].rstrip("*")]["gpus"].setdefault(t, {"total": 0, "used": 0, "free": 0})
+            g["total"] += n
+            g["used"] += min(used.get(t, 0), n)
+            g["free"] = g["total"] - g["used"]
+    loaded = "cqueue" in sec and "waits" in sec
+    hidden = bool(user) and users == {user}     # every job in the scheduler's view is mine: other people's are not shown
+    for p in cl.values():
+        med = p["median_wait_min"]
+        p["label"] = ("unknown" if not loaded or hidden else
+                      "unknown" if med is None and p["waiting"] else "GOOD" if med is None else
+                      "GOOD" if med < th["cluster_wait_ok_min"] else "OK" if med < th["cluster_wait_poor_min"] else "POOR")
+    known_c = [p for p in cl.values() if p["label"] in RANK]
+    if not loaded or not cl:
+        clabel, cnote = "unknown", "cluster load unavailable"
+    elif hidden:
+        clabel, cnote = "unknown", "the scheduler shows only your own jobs"
+    elif not known_c:
+        clabel, cnote = "unknown", "too few recent starts to judge the waits"
+    else:
+        clabel = max((p["label"] for p in known_c), key=RANK.get)
+        cnote = ", ".join(f"{p['partition']} median wait {fmt_dur(p['median_wait_min'])}" for p in sorted(known_c, key=lambda p: p["partition"])
+                          if p["label"] != "GOOD") or "queues start jobs quickly"
+    cluster = {"label": clabel, "note": cnote, "usable": loaded and not hidden and bool(cl), "window_h": th["wait_window_h"],
+               "thresholds": {"ok_min": th["cluster_wait_ok_min"], "poor_min": th["cluster_wait_poor_min"]},
+               "partitions": sorted(cl.values(), key=lambda p: p["partition"])}
+
+    # ---- advice: what an agent (or you) should change, given the readings above; empty when all is well
+    advice = []
+    if blocked:
+        advice.append({"code": "caps", "kind": "plan", "text": f"{blocked} job{'s' if blocked > 1 else ''} held back by a per-user cap: pack rows with "
+                                               "--rows-per-job instead of adding jobs, and let the queue drain before submitting more."})
+    if fair["label"] in ("OK", "POOR"):
+        advice.append({"code": "fairshare", "kind": "plan", "text": f"Fair share is {fair['label']} ({fair['factor']:.2f}) and jobs are billed on what they "
+                       "allocate: size CPUs and memory from a pilot's measured use, set --time near the measured runtime, and pilot "
+                       "before any large submit."})
+    busy = [p for p in cluster["partitions"] if p["label"] == "POOR"]
+    if busy:
+        advice.append({"code": "busy_queue", "kind": "plan", "text": "Busy right now: " + ", ".join(f"{p['partition']} (median wait {fmt_dur(p['median_wait_min'])})"
+                       for p in busy) + ". Ask for a shorter --time so a job can backfill, and never cancel and resubmit a job that is only waiting."})
+    groups = {}
+    for p in cluster["partitions"]:            # queues that share nodes show the same GPUs: report them once
+        if p["gpus"]:
+            groups.setdefault(tuple(sorted((t, g["total"], g["free"]) for t, g in p["gpus"].items())), []).append(p["partition"])
+    def few(items, n):                         # at most n names, then how many were left out
+        return ", ".join(items[:n]) + (f" (+{len(items) - n} more)" if len(items) > n else "")
+    full = [f"No free {few([t for t, total, free in key if total and not free], 3)} GPU on {', '.join(names)}: a job asking for it will wait. "
+            f"Free now: {few([f'{t} {free}' for t, total, free in sorted(key, key=lambda k: -k[2]) if free], 4) or 'nothing'}."
+            for key, names in groups.items() if any(total and not free for t, total, free in key)]
+    if full:
+        advice.append({"code": "gpu_full", "kind": "note", "text": " ".join(full)})
+
+    # ---- verdict
+    known = [x["label"] for x in (queue, fair) if x["label"] in RANK]
+    overall = max(known, key=RANK.get) if known else "unknown"
+    if fair["label"] == "unknown":
+        fpart, fbrief = "fair share unavailable", "fair share unknown"
+    else:
+        ratio = f"account at {fair['ratio']:.1f}x its share, " if fair["ratio"] is not None else ""
+        fpart = (f"fair share {fair['label']} ({fair['factor']:.2f}: {ratio}"
+                 f"{fair['accounts_above']} of {fair['accounts_total']} accounts use more)")
+        fbrief = f"fair share {fair['label'].lower()} {fair['factor']:.2f}"
+    return {"user": user, "account": account, "cluster_time": now.isoformat(timespec="minutes") if now else None,
+            "overall": overall, "queue": queue, "fairshare": fair, "cluster": cluster, "advice": advice,
+            "verdict": f"{overall} — {fpart} · queue {qlabel} ({qnote})",
+            "brief": f"{fbrief}, queue {qlabel.lower()}"}
+
+
+STYLE = {"red": "31", "green": "32", "yellow": "33", "cyan": "36", "bold": "1", "dim": "2", "rev": "7"}
+LABEL_STYLE = {"GOOD": "green", "OK": "yellow", "POOR": "red", "unknown": "dim"}
+ASCII = str.maketrans({"─": "-", "█": "#", "░": ".", "·": "|", "—": "-", "≥": ">", "×": "x", "…": "~"})
+
+
+def use_color(tty: bool, env) -> bool:
+    """Colour on a terminal, unless NO_COLOR is set; FORCE_COLOR turns it on elsewhere (a pager, a test)."""
+    if env.get("NO_COLOR"):
+        return False
+    return bool(env.get("FORCE_COLOR")) or tty
+
+
+def unicode_ok(env, encoding) -> bool:
+    """Unicode needs both a UTF-8 locale (LC_ALL, else LC_CTYPE, else LANG; none set counts as UTF-8) and a stream that can
+    encode it. Python coerces a C locale to UTF-8 for its streams, so the stream alone would never say no."""
+    locale = next((env[k] for k in ("LC_ALL", "LC_CTYPE", "LANG") if env.get(k)), "")
+    return bool(encoding) and encoding.lower().replace("-", "") .startswith("utf") and (not locale or "utf" in locale.lower())
+
+
+def bar(frac, width: int, uni: bool = True) -> str:
+    """A gauge of `width` cells filled to `frac` (0 to 1); a nonzero fraction always shows at least one cell."""
+    frac = 0.0 if frac is None else max(0.0, min(1.0, frac))
+    n = max(1, round(frac * width)) if frac > 0 else 0
+    full, empty = ("█", "░") if uni else ("#", ".")
+    return full * n + empty * (width - n)
+
+
+def render_standing(s: dict, color: bool = False, width: int = 80, uni: bool = True) -> str:
+    """The report, in the look of `npl`: a title line, centred rules, indented rows, gauges. Every row is cut to the
+    terminal width, and colour only wraps text in escape codes, so stripping them leaves exactly the plain report."""
+    def paint(text, *styles):
+        return f"\033[{';'.join(STYLE[x] for x in styles)}m{text}\033[0m" if color and styles else text
+
+    def row(*parts):          # parts: "text" or ("text", "style", ...); the row never passes `width` columns
+        room, out = width, []
+        for part in parts:
+            text, styles = (part, ()) if isinstance(part, str) else (part[0], part[1:])
+            if room <= 0:
+                break
+            if len(text) > room:
+                text = text[:room - 1] + "…"
+            room -= len(text)
+            out.append(paint(text, *styles))
+        return "".join(out)
+
+    def rule(title):
+        left = (width - len(title) - 2) // 2
+        return paint("─" * left, "dim") + f" {paint(title, 'bold')} " + paint("─" * (width - left - len(title) - 2), "dim")
+
+    f, q = s["fairshare"], s["queue"]
+    gw = 20 if width >= 72 else 12 if width >= 60 else 8        # gauge width
+    nw = max([10] + [len(p["partition"]) + 1 for p in q["partitions"] + s["cluster"]["partitions"]])   # name column
+    gq = max(8, min(gw, width - nw - 52))                        # gauge width on the queue and cluster rows
+    users = f" · {f['n_users']} users" if f.get("n_users") else ""
+    clock = f" · cluster time {s['cluster_time'].replace('T', ' ')}" if s["cluster_time"] else ""
+    out = ["", row(("Explorer standing", "bold"), (clock, "dim")), "",
+           row("  ", (f"[{s['overall'].upper()}]", LABEL_STYLE.get(s["overall"], "dim"), "bold", "rev"), "  " + s["brief"].replace(", ", " · ")),
+           row("  ", (f"{s['user'] or '?'} · account {s['account'] or '?'}{users}", "dim")), "", rule("Queue")]
+    for p in q["partitions"]:
+        cap, hot = p["cap"], bool(p["cap"] and p["running"] >= 0.8 * p["cap"])
+        jobs = f"{p['running']} of {cap} running" if cap else f"{p['running']} running"
+        out.append(row(f"  {p['partition']:<{nw}} ", (bar(p["running"] / cap if cap else None, gq, uni), "red" if hot else "green" if p["running"] else "dim"),
+                       f"  {jobs:<17}", (f"{p['pending']} pending", "yellow" if p["pending"] else "dim"),
+                       (f" · {fmt_limit(p['limit_h'])} max" if p.get("limit_h") else "", "dim")))
+        if p["reasons"]:         # why they wait, and for how long, on a line of their own so it is never cut off
+            why = ", ".join("nodes down or reserved" if r.startswith("Nodes required for job") else r for r in p["reasons"])
+            out.append(row(" " * (nw + 3), (why + (f" · oldest {p['oldest_wait_h']:g} h" if p["oldest_wait_h"] is not None else ""), "yellow")))
+    if not q["partitions"]:
+        out.append(row("  ", ("no jobs in the queue", "dim")))
+    out += [row(f"  {'status':<{nw}} ", (q["label"], LABEL_STYLE.get(q["label"], "dim"), "bold"), (f" · {q['note']}", "dim")), "", rule("Cluster")]
+    c = s["cluster"]
+    if c["usable"]:
+        for p in c["partitions"]:
+            lab, busy, n = LABEL_STYLE.get(p["label"], "dim"), p["cores_busy_pct"], p["started"]
+            out.append(row(f"  {p['partition']:<{nw}} ", (bar(None if busy is None else busy / 100, gq, uni), lab),
+                           f"  {f'{busy:.0f}% busy' if busy is not None else 'load unknown':<9}", (f" {p['label']:<7}", lab, "bold"),
+                           f" {p['waiting']} waiting", (f" · {p['held']} held" if p["held"] else "", "dim")))
+            bits = [f"median wait {fmt_dur(p['median_wait_min'])} · slowest tenth {fmt_dur(p['p90_wait_min'])}" if p["median_wait_min"] is not None
+                    else f"only {n} job{'s' if n != 1 else ''} started in the last {c['window_h']:g} h" if n
+                    else f"no job started in the last {c['window_h']:g} h"]
+            if p["oldest_waiting_h"] is not None:
+                bits.append(f"oldest waiting {fmt_dur(p['oldest_waiting_h'] * 60)}")
+            if len(" · ".join(bits)) > width - nw - 3:        # too long for one line: one fact per line, none cut off
+                out += [row(" " * (nw + 3), (b, "dim")) for b in bits]
+            else:
+                out.append(row(" " * (nw + 3), (" · ".join(bits), "dim")))
+    else:
+        out.append(row("  ", (c["note"], "dim")))
+    groups = {}
+    for p in c["partitions"]:                  # queues that share nodes share their GPUs: list them once
+        if p["gpus"]:
+            groups.setdefault(tuple(sorted((t, g["total"], g["free"]) for t, g in p["gpus"].items())), []).append(p["partition"])
+    for key, names in groups.items():
+        out.append(row(f"  {'free GPUs':<{nw}} ", (" · ".join(names), "dim")))
+        line, used = [], 0
+        for t, total, free in key:             # a type with none free is red, a quarter or less yellow
+            item = f"{t} {free} of {total}"
+            if line and used + 3 + len(item) > width - nw - 3:
+                out.append(row(" " * (nw + 3), *line))
+                line, used = [], 0
+            used += len(item) + (3 if line else 0)
+            line += ([(" · ", "dim")] if line else []) + [(item, "red" if not free else "yellow" if free <= total / 4 else "green")]
+        out.append(row(" " * (nw + 3), *line))
+    out += [row(f"  {'status':<{nw}} ", (c["label"], LABEL_STYLE.get(c["label"], "dim"), "bold"), (f" · {c['note']}", "dim")), "", rule("Fair share")]
+    if f["label"] == "unknown":
+        out.append(row("  ", ("the cluster did not return the fair-share tree (sshare)", "dim")))
+    else:
+        th, lab = f["thresholds"], LABEL_STYLE[f["label"]]
+        out.append(row(f"  {'factor':<9}  ", (bar(f["factor"], gw, uni), lab), " ", (f"{f['factor']:.3f}", lab, "bold"),
+                       (f"   good ≥ {th['good']:g} · ok ≥ {th['low']:g}", "dim")))
+        if f["ratio"] is not None:
+            out.append(row(f"  {'usage':<9}  ", (f"{f['ratio']:.1f}x", "bold"),
+                           f" its equal share · {f['accounts_above']} of {f['accounts_total']} accounts use more"))
+            if f["recovery_days"]:
+                out.append(row(f"  {'recovery':<9}  ", (f"about {f['recovery_days']:.0f} days", "bold"),
+                               f" of no use to reach 1x (half-life {f['half_life_days']:g} d)"))
+        others = max(f["n_users"] - 1, 0)
+        out.append(row(f"  {'account':<9}  you ", (bar(f["your_usage_pct"] / 100, gw, uni), "cyan"), f" {f['your_usage_pct']:.0f}%",
+                       (f" · the other {others} user{'' if others == 1 else 's'} {f['others_pct']:.0f}%", "dim")))
+        for u in f.get("users", []):
+            out.append(row((f"             {u['user']:<18} {u['usage_pct']:>5.1f}%  factor {u['factor'] if u['factor'] is not None else '-'}", "dim")))
+        if f["fairshare_points"] is not None:
+            out.append(row(f"  {'priority':<9}  fair share gives a new job {f['fairshare_points']:,} of {f['max_fairshare_points']:,} points"))
+        if f["priority"]:
+            pr, n = f["priority"], sum(x["pending"] for x in q["partitions"])
+            out.append(row((f"             {n} pending avg {pr['priority']:,} of {f['max_priority']:,} "
+                            f"(fair share {pr['fairshare']:,}, age {pr['age']:,})", "dim")))
+    if s["advice"]:
+        out += ["", rule("Advice")]
+        for a in s["advice"]:
+            for i, text in enumerate(textwrap.wrap(a["text"], width - 4, break_on_hyphens=False, break_long_words=False)):
+                out.append(row(("  - " if i == 0 else "    ") + text))
+    out += ["", row(("  --users names the others · --brief one line · --json for scripts", "dim")), ""]
+    text = "\n".join(out)
+    return text if uni else text.translate(ASCII)
+
+
 # --------------------------------------------------------------------------- commands
 
 EXAMPLE_CONFIG = (Path(__file__).parent / "example_config.toml")
@@ -1006,6 +1478,29 @@ def cmd_runs(args, cfg, R):
     emit(rows, args)
 
 
+GPU_HOUR_COST = 100       # about how many CPU-hours the scheduler bills for one GPU-hour on Explorer (an estimate, not a published rate)
+
+
+def waste(tasks: list) -> dict:
+    """What a set of finished tasks allocated and did not use, weighted by hours: the share of core-hours that sat idle (CPU-only
+    tasks: a GPU job's cores are incidental next to its GPU), of sampled GPU-hours that sat idle, and of billed hours spent on tasks
+    that did not complete."""
+    cpu_known = cpu_used = gpu_known = gpu_used = billed = lost = 0.0
+    for x in tasks:
+        if x["cpu_eff"] is not None and not x["gpus"]:
+            cpu_known += x["cpu_hours"]
+            cpu_used += x["cpu_eff"] * x["cpu_hours"]
+        if x["gpu_util_mean"] is not None:
+            gpu_known += x["gpu_hours"]
+            gpu_used += x["gpu_hours"] * x["gpu_util_mean"] / 100
+        hours = x["cpu_hours"] + GPU_HOUR_COST * x["gpu_hours"]
+        billed += hours
+        lost += hours if x["state"] != "COMPLETED" else 0
+    idle = lambda used, known: round(100 * (1 - used / known), 1) if known else "-"
+    return {"cpu_idle_%": idle(cpu_used, cpu_known), "gpu_idle_%": idle(gpu_used, gpu_known),
+            "failed_%": round(100 * lost / billed, 1) if billed else "-"}
+
+
 def cmd_usage(args, cfg, R):
     if args.run:
         entries = [find_run(r) for r in args.run]
@@ -1020,7 +1515,7 @@ def cmd_usage(args, cfg, R):
     if args.project:
         entries = [e for e in entries if e.get("project") == args.project]
     recs = ensure_usage(cfg, R, entries)
-    rows, totals = [], {}
+    rows, totals, pooled = [], {}, {}
     for e in entries:
         u = recs.get(e["run_id"])
         if not u:
@@ -1036,13 +1531,16 @@ def cmd_usage(args, cfg, R):
                "gpu_h": tot["gpu_hours"], "req_gpu_h": tot["worst_case_gpu_hours"], "cpu_h": tot["cpu_hours"],
                "time_%": round(100 * time_eff) if time_eff is not None else "-",
                "gpu_util_%": round(sum(util) / len(util)) if util else "-",
-               "mem_%": round(100 * max(mem)) if mem else "-"}
+               "mem_%": round(100 * max(mem)) if mem else "-", "cpu_idle_%": waste(t)["cpu_idle_%"]}
         rows.append(row)
         for key in (row["project"], "all"):
             g = totals.setdefault(key, {"project": key, "runs": 0, "gpu_h": 0.0, "req_gpu_h": 0.0, "cpu_h": 0.0})
             g["runs"] += 1
             for f in ("gpu_h", "req_gpu_h", "cpu_h"):
                 g[f] = round(g[f] + row[f], 2)
+            pooled.setdefault(key, []).extend(t)
+    for key, g in totals.items():
+        g.update(waste(pooled[key]))
     totals = sorted(totals.values(), key=lambda g: g["project"] == "all")
     unfinished = [e["run_id"] for e in entries if e["run_id"] not in recs]
     if args.json:
@@ -1054,6 +1552,20 @@ def cmd_usage(args, cfg, R):
         emit(totals, args)
     if unfinished:
         print(f"[nuhpc] {len(unfinished)} run(s) not finished yet, not counted", file=sys.stderr)
+
+
+def cmd_standing(args, cfg, R):
+    s = parse_standing(R.run(standing_query(standing_thresholds(cfg)["wait_window_h"])), cfg, users=args.users)
+    if args.json:
+        return emit(s, args)
+    color = use_color(sys.stdout.isatty(), os.environ)
+    uni = unicode_ok(os.environ, getattr(sys.stdout, "encoding", None))
+    if args.brief:
+        head, _, rest = s["verdict"].partition(" ")
+        line = (f"\033[1;{STYLE[LABEL_STYLE.get(head, 'dim')]}m{head}\033[0m {rest}" if color else s["verdict"])
+        return print(line if uni else line.translate(ASCII))
+    width = min(100, max(50, shutil.get_terminal_size((80, 24)).columns))
+    print(render_standing(s, color=color, width=width, uni=uni))
 
 
 def cmd_queue(args, cfg, R):
@@ -1208,6 +1720,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--since", default="7d", help="runs submitted within e.g. 48h or 7d (default), or 'all'")
     p.add_argument("--project", help="only runs tagged with this project")
     sub("queue", cmd_queue, "your jobs in the Slurm queue")
+    p = sub("standing", cmd_standing, "queue pressure against the live caps and your account's fair-share standing, "
+                                      "with a verdict (read-only, one login-node call)")
+    p.add_argument("--users", action="store_true", help="name the other users in your account and their share of its usage")
+    p.add_argument("--brief", action="store_true", help="print only the one-line verdict")
     p = sub("push", cmd_push, "upload data to the work root's data/ folder")
     p.add_argument("local")
     p.add_argument("--project", help="use this declared project's work root")

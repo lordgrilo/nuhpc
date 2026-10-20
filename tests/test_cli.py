@@ -1,11 +1,15 @@
 """Offline tests: pure helpers, submit guardrails, and rendered job scripts executed locally
 against stub binaries (no cluster, no ssh). Run with: uv run --with pytest pytest"""
 import json
+import math
+import shlex
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -766,3 +770,546 @@ def test_gpu_jobs_are_never_judged_against_cpu_node_sizes(tmp_path, pack_env):
     for cpus, mem, gres in (("12", "120G", "gpu:a100:1"), ("16", "200G", "gpu:h200:1")):
         rc, res = submit_rows(pack_env, tmp_path, 1, "--cpus", cpus, "--mem", mem, "--gres", gres, "--partition", "gpu-short")
         assert rc == 0 and res["warnings"] == [], (cpus, mem, res["warnings"])
+
+
+# ---- nuhpc standing: queue pressure and fair share, with a verdict ----
+
+M = "__nuhpc_standing__"
+SHARE_ROWS = [      # Account|User|RawShares|NormShares|RawUsage|NormUsage|EffectvUsage|FairShare|LevelFS
+    "root||1|1.000000|20306784339||1.000000||",
+    " bigacct||1|0.000890|90000000|0.010|0.010||0.089",
+    " midacct||1|0.000890|40000000|0.005|0.005||0.178",
+    " lab.pi||1|0.000890|68745922|0.003369|0.003369||0.264054",
+    "  lab.pi|m.other|1|0.090909|51258530|0.002|0.002500|0.132622|0.121924",
+    "  lab.pi|me.pi|1|0.090909|15798936|0.0008|0.000800|0.132704|0.395573",
+    "  lab.pi|a.third|1|0.090909|1478310|0.00005|0.000050|0.132786|4.227547",
+    "  lab.pi|z.idle|1|0.090909|0|0|0.000000|0.133443|inf",
+    " lowacct||1|0.000890|10000000|0.001|0.001||0.89",
+    " idleacct||1|0.000890|0|0|0.000000||inf",
+]
+
+
+NOW = datetime(2026, 10, 16, 10, 0, 0)
+PART = ["PartitionName=short QoS=short MaxTime=2-00:00:00 ", "PartitionName=gpu QoS=gpu MaxTime=08:00:00 ",
+        "PartitionName=gpu-short QoS=gpu-short MaxTime=02:00:00 ", "PartitionName=gpu-interactive QoS=gpu-interactive MaxTime=02:00:00 ",
+        "PartitionName=sharing QoS=sharing MaxTime=01:00:00 "]
+CORES = ["short|3157/439/700/4296", "gpu|586/550/60/1196", "gpu-short|586/550/60/1196", "gpu-interactive|586/550/60/1196",
+         "sharing|4306/3466/6000/13772"]                                   # Partition|allocated/idle/other/total cores
+_GPU_NODES = ["a1 allocated gpu:a100:4(S:0-1) gpu:a100:4(IDX:0-3)", "a2 mixed gpu:a100:3 gpu:a100:3(IDX:0-2)",
+              "h1 mixed gpu:h200:8(S:0-1) gpu:h200:6(IDX:0-5)", "h2 down* gpu:h200:8(S:0-1) gpu:h200:0(IDX:N/A)",
+              "t1 idle gpu:t4:4(S:0-1) gpu:t4:0(IDX:N/A)"]
+GPUS = ([f"{p:<16} {n}" for p in ("gpu", "gpu-short", "gpu-interactive") for n in _GPU_NODES]
+        + [f"{'sharing':<16} s1 mixed gpu:l40s:3 gpu:l40s:1(IDX:0)", f"{'short':<16} n9 mixed (null) (null)"])
+# Partition|State|Reason|Submit|JobId|User, for everyone: the cluster, not just me
+CQUEUE = [
+    "short|RUNNING|None|2026-10-15T08:00:00|100|u1", "short|RUNNING|None|2026-10-15T08:00:00|101|u2",
+    "short|RUNNING|None|2026-10-15T08:00:00|102|u3",
+    "short|PENDING|Priority|2026-10-15T22:00:00|103|u1",                      # waits 12 h
+    "short|PENDING|Priority|2026-10-16T06:00:00|104_[1-4%2]|u2",              # an array of 4
+    "short|PENDING|Resources|2026-10-16T09:00:00|105|u3",
+    "short|PENDING|Nodes required for job are DOWN, DRAINED or reserved for jobs in higher priority partitions|2026-10-16T09:30:00|106|u4",
+    "short|PENDING|Dependency|2026-10-14T09:00:00|107|u4", "short|PENDING|JobHeldUser|2026-10-14T09:00:00|108|u4",
+    "short|PENDING|QOSMaxJobsPerUserLimit|2026-10-16T09:00:00|109|u1", "short|PENDING|BeginTime|2026-10-16T09:00:00|110|u1",
+    "gpu|RUNNING|None|2026-10-16T01:00:00|200|u1", "gpu|RUNNING|None|2026-10-16T01:00:00|201|u2",
+    "gpu|PENDING|Priority|2026-10-16T08:00:00|202|u3",
+    "gpu,gpu-short|PENDING|Priority|2026-10-16T09:00:00|203|u4",              # waits in both queues
+    "gpu-short|PENDING|Priority|2026-10-16T09:45:00|204|u4"]
+
+
+def started(part, wait_min, ago_min=60, submit_extra=1000, eligible="yes"):
+    """A sacct row for a job that started `ago_min` minutes before NOW after `wait_min` minutes of being eligible."""
+    fmt = lambda t: t.strftime("%Y-%m-%dT%H:%M:%S")
+    start = NOW - timedelta(minutes=ago_min)
+    ready = start - timedelta(minutes=wait_min)
+    return f"{part}|{fmt(ready - timedelta(minutes=submit_extra))}|{fmt(ready) if eligible == 'yes' else eligible}|{fmt(start)}"
+
+
+WAITS = ([started("short", w, ago_min=30 + 40 * i) for i, w in enumerate([5, 10, 60, 120, 300, 900])]      # median 90, p90 300
+         + [started("short", 3000, ago_min=72 * 60)]                       # started 3 days ago: outside the 6 h window
+         + ["short|2026-10-16T09:00:00|2026-10-16T09:00:00|Unknown"]       # still pending: not a start
+         + [started("gpu", w, ago_min=20 * (i + 1)) for i, w in enumerate([1, 2, 3, 4, 5, 6])]            # median 3.5
+         + [started("gpu-short", w, ago_min=50) for w in (20, 40, 60)])                                   # too few for a median
+
+
+def standing_out(queue=None, share=None, qos=None, prio=None, config=None, now="2026-10-16T10:00:00",
+                 part=None, cores=None, gpus=None, cqueue=None, waits=None):
+    queue = queue if queue is not None else [
+        "gpu|PENDING|Priority|2026-10-15T15:18:04|11101394_[0-6%4]|sweep-llama",
+        "gpu-short|PENDING|Nodes required for job are DOWN, DRAINED or reserved for jobs in higher priority partitions|2026-10-15T14:24:38|11100487|pilot-run",
+        "short|RUNNING|None|2026-10-16T08:00:00|11300001|a", "short|RUNNING|None|2026-10-16T08:00:00|11300002|b"]
+    blocks = {"me": ["me.pi", "lab.pi"], "now": [now],
+              "qos": qos if qos is not None else ["short|50|1000", "gpu|4|8", "gpu-short|2|8", "gpu-interactive|2|4", "sharing|2|4", "normal||"],
+              "part": part if part is not None else PART,
+              "queue": queue, "share": share if share is not None else SHARE_ROWS,
+              "prio": prio if prio is not None else ["11100487 5821 576 2654 2500 0", "11101394 5795 550 2654 2500 0"],
+              "config": config if config is not None else [
+                  "PriorityDecayHalfLife   = 7-00:00:00", "PriorityWeightAge       = 5000", "PriorityWeightFairShare = 20000",
+                  "PriorityWeightJobSize   = 2500", "PriorityWeightPartition = 0", "PriorityWeightQOS       = 2500"],
+              "cores": cores if cores is not None else CORES, "gpus": gpus if gpus is not None else GPUS,
+              "cqueue": cqueue if cqueue is not None else CQUEUE, "waits": waits if waits is not None else WAITS}
+    return "\n".join(f"{M} {k}\n" + "\n".join(v) for k, v in blocks.items()) + "\n"
+
+
+def standing(out=None, users=False, **thresholds):
+    return cli.parse_standing(standing_out() if out is None else out, {"standing": thresholds}, users=users)
+
+
+def test_standing_reads_the_fair_share_tree():
+    f = standing()["fairshare"]
+    assert f["label"] == "POOR" and f["factor"] == pytest.approx(0.132704)
+    assert f["ratio"] == pytest.approx(0.003369 / 0.000890, rel=1e-3)              # 3.8x its equal share
+    assert (f["accounts_above"], f["accounts_total"]) == (2, 5)                    # bigacct and midacct use more; root is not an account
+    assert f["fairshare_points"] == round(0.132704 * 20000) and f["max_fairshare_points"] == 20000
+    assert f["half_life_days"] == 7 and f["recovery_days"] == pytest.approx(7 * math.log2(1 / 0.264054), rel=1e-3)
+    assert f["priority"] == {"priority": 5808, "age": 563, "fairshare": 2654, "jobsize": 2500, "qos": 0}
+    assert f["max_priority"] == 30000
+
+
+def test_standing_splits_the_accounts_usage_without_naming_colleagues():
+    f = standing()["fairshare"]
+    assert f["n_users"] == 4 and f["your_usage_pct"] == pytest.approx(100 * 15798936 / sum([51258530, 15798936, 1478310, 0]), rel=1e-6)
+    assert f["others_pct"] == pytest.approx(100 - f["your_usage_pct"]) and "users" not in f
+    names = standing(users=True)["fairshare"]["users"]
+    assert [u["user"] for u in names][:2] == ["m.other", "me.pi"] and "a.third" in [u["user"] for u in names]
+    assert "m.other" not in json.dumps(standing())
+
+
+def test_standing_queue_counts_slots_against_the_live_caps_and_the_oldest_wait():
+    q = {p["partition"]: p for p in standing()["queue"]["partitions"]}
+    assert (q["short"]["running"], q["short"]["cap"], q["short"]["pending"]) == (2, 50, 0)
+    assert (q["gpu"]["pending"], q["gpu"]["cap"], q["gpu"]["reasons"]) == (7, 4, {"Priority": 7})   # a pending array of 7 tasks
+    assert q["gpu-short"]["oldest_wait_h"] == pytest.approx(19.6, abs=0.1)
+    s = standing()
+    assert s["queue"]["label"] == "OK" and s["queue"]["waiting_long"] == 2 and s["queue"]["blocked_by_caps"] == 0
+    assert s["overall"] == "POOR" and s["verdict"].startswith("POOR") and "3.8x" in s["verdict"]
+    assert s["brief"] == "fair share poor 0.13, queue ok"
+
+
+def test_standing_queue_is_poor_only_when_a_cap_blocks_jobs():
+    blocked = ["short|RUNNING|None|2026-10-16T08:00:00|1|a"] * 50 + [
+        "short|PENDING|QOSMaxJobsPerUserLimit|2026-10-16T09:00:00|2|b", "short|PENDING|JobArrayTaskLimit|2026-10-16T09:00:00|3_[1-9%3]|c"]
+    s = standing(standing_out(queue=blocked))
+    assert s["queue"]["label"] == "POOR" and s["queue"]["blocked_by_caps"] == 1       # JobArrayTaskLimit is your own throttle
+    near = standing(standing_out(queue=["short|RUNNING|None|2026-10-16T08:00:00|1|a"] * 41))
+    assert near["queue"]["label"] == "OK" and "41/50" in near["queue"]["note"]
+    calm = standing(standing_out(queue=["short|RUNNING|None|2026-10-16T08:00:00|1|a"] * 5))
+    assert calm["queue"]["label"] == "GOOD"
+    assert standing(standing_out(queue=[]))["queue"]["label"] == "GOOD"
+
+
+def test_standing_fair_share_labels_follow_the_thresholds():
+    def with_factor(x):
+        return [r.replace("|0.132704|", f"|{x}|") for r in SHARE_ROWS]
+    assert standing(standing_out(share=with_factor(0.8)))["fairshare"]["label"] == "GOOD"
+    assert standing(standing_out(share=with_factor(0.4)))["fairshare"]["label"] == "OK"
+    assert standing(standing_out(share=with_factor(0.4)), fairshare_good=0.3)["fairshare"]["label"] == "GOOD"
+    s = standing(standing_out(share=with_factor(0.8), queue=["short|RUNNING|None|2026-10-16T08:00:00|1|a"] * 5))
+    assert s["overall"] == "GOOD" and s["brief"] == "fair share good 0.80, queue good"
+
+
+def test_standing_degrades_when_the_cluster_withholds_a_section():
+    s = standing(standing_out(share=[]))
+    assert s["fairshare"]["label"] == "unknown" and "fair share unavailable" in s["verdict"]
+    assert s["overall"] == s["queue"]["label"] == "OK"        # with no fair-share reading, the queue decides (2 jobs wait over 6 h)
+    s = standing("")                                  # nothing at all, as in a dry run
+    assert s["overall"] == s["fairshare"]["label"] == s["queue"]["label"] == "unknown"   # no data is not good news
+    assert s["verdict"].startswith("unknown") and s["brief"] == "fair share unknown, queue unknown"
+
+
+def test_standing_remote_shell_runs_read_only_queries_and_survives_a_failing_one(tmp_path):
+    """The whole remote side, run locally against stub Slurm commands."""
+    stubs = {
+        "sacctmgr": 'case "$*" in *assoc*) echo lab.pi;; *qos*) printf "short|50|1000\\ngpu-short|2|8\\n";; esac',
+        "scontrol": 'case "$*" in *partition*) echo "PartitionName=short AllowGroups=ALL QoS=short MaxTime=2-00:00:00";; '
+                    '*config*) printf "PriorityDecayHalfLife   = 7-00:00:00\\nPriorityWeightFairShare = 20000\\nMaxJobCount = 1\\n";; esac',
+        "squeue": 'echo "short|RUNNING|None|2026-10-16T08:00:00|11300001|a"',
+        "sshare": "printf '%s\\n' " + " ".join(shlex.quote(r) for r in SHARE_ROWS),
+        "sprio": 'echo "11100487 5821 576 2654 2500 0"',
+        "date": 'echo 2026-10-16T10:00:00'}
+    env = {**os.environ, "USER": "me.pi", "PATH": f"{stub_bin(tmp_path, **stubs)}:{os.environ['PATH']}"}
+    p = subprocess.run(["bash", "-c", cli.standing_query()], capture_output=True, text=True, env=env)
+    assert p.returncode == 0, p.stderr
+    s = cli.parse_standing(p.stdout, {})
+    assert s["user"] == "me.pi" and s["account"] == "lab.pi" and s["fairshare"]["factor"] == pytest.approx(0.132704)
+    assert s["fairshare"]["half_life_days"] == 7 and s["queue"]["partitions"][0]["cap"] == 50
+    stub_bin(tmp_path, sshare="exit 1")               # one query failing must not sink the others
+    p = subprocess.run(["bash", "-c", cli.standing_query()], capture_output=True, text=True, env=env)
+    assert p.returncode == 0 and cli.parse_standing(p.stdout, {})["fairshare"]["label"] == "unknown"
+    q = cli.standing_query()                           # read-only: nothing here can change the cluster
+    assert not any(w in q for w in ("scancel", "sbatch", "srun", "update", "sacctmgr add", "modify", "delete", " rm ", "kill"))
+
+
+def test_standing_command_prints_a_report_and_a_json_form(inproc, monkeypatch, capsys):
+    inproc([])
+    monkeypatch.setattr(cli.Remote, "run", lambda self, cmd, retry=True: standing_out())
+    cli.main(["standing"])
+    out = capsys.readouterr().out
+    assert "POOR" in out and "3.8x" in out and "Queue" in out and "Fair share" in out and "m.other" not in out
+    cli.main(["standing", "--brief"])
+    assert capsys.readouterr().out.strip().startswith("POOR — fair share POOR")
+    cli.main(["--json", "standing"])
+    d = json.loads(capsys.readouterr().out)
+    assert d["overall"] == "POOR" and d["brief"] == "fair share poor 0.13, queue ok" and d["fairshare"]["accounts_total"] == 5
+    cli.main(["--json", "standing", "--users"])
+    assert "m.other" in capsys.readouterr().out
+
+
+# ---- nuhpc standing: how the report looks in a terminal ----
+
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def shown(text):
+    return ANSI.sub("", text)
+
+
+def render(color=False, width=72, uni=True, **thresholds):
+    return cli.render_standing(standing(**thresholds), color=color, width=width, uni=uni)
+
+
+def test_report_has_a_title_rules_bars_and_aligned_rows():
+    text = render()
+    lines = text.splitlines()
+    assert lines[1] == "Explorer standing · cluster time 2026-10-16 10:00"
+    assert lines[3].strip().startswith("[POOR]") and "fair share poor 0.13 · queue ok" in lines[3]
+    assert lines[4].strip() == "me.pi · account lab.pi · 4 users"
+    assert any(l.startswith("─") and " Queue " in l for l in lines) and any(l.startswith("─") and " Fair share " in l for l in lines)
+    assert any(l.strip().startswith("short") and "2 of 50 running" in l and "░" in l for l in lines)
+    i = next(i for i, l in enumerate(lines) if l.strip().startswith("gpu ") and "7 pending" in l)
+    assert lines[i + 1].strip() == "Priority · oldest 18.7 h"                       # the reason and the wait, never cut off
+    j = next(i for i, l in enumerate(lines) if l.strip().startswith("gpu-short"))
+    assert lines[j + 1].strip() == "nodes down or reserved · oldest 19.6 h"        # the long Slurm reason, shortened for display
+    gpu_short = next(p for p in cli.parse_standing(standing_out(), {})["queue"]["partitions"] if p["partition"] == "gpu-short")
+    assert "Nodes required" not in text and "Nodes required" in str(gpu_short["reasons"])
+    factor = next(l for l in lines if l.strip().startswith("factor"))
+    assert "█" in factor and "0.133" in factor and "ok ≥ 0.25" in factor and "good ≥ 0.5" in factor
+    assert any(l.strip().startswith("usage") and "3.8x its equal share" in l and "2 of 5 accounts use more" in l for l in lines)
+    assert any(l.strip().startswith("recovery") and "13 days of no use to reach 1x" in l for l in lines)
+    assert any(l.strip().startswith("account") and "you" in l and "23%" in l and "77%" in l for l in lines)
+    assert any(l.strip().startswith("priority") and "2,654 of 20,000" in l for l in lines)       # factor 0.1327 x weight 20,000
+    assert any("8 pending avg 5,808 of 30,000" in l and "fair share 2,654" in l for l in lines)
+    assert any(l.strip().startswith("status") and "OK · 2 waiting over 6 h" in l for l in lines)
+
+
+def test_report_never_runs_past_the_terminal_width():
+    for width in (50, 72, 100):
+        assert all(len(shown(l)) <= width for l in render(width=width, color=True).splitlines()), width
+
+
+def test_report_has_an_ascii_form_for_terminals_without_unicode():
+    text = render(uni=False)
+    assert all(ord(c) < 128 for c in text) and "#" in text and "Queue" in text and "|" in text
+
+
+def test_colours_change_only_the_escape_codes():
+    plain, coloured = render(), render(color=True)
+    assert "\x1b[" not in plain and shown(coloured) == plain
+    assert "\x1b[31m" in coloured                                  # POOR fair share is red
+    good = cli.render_standing(standing(standing_out(share=[r.replace("|0.132704|", "|0.8|") for r in SHARE_ROWS], gpus=[],   # a full GPU type is red too
+                                                    queue=["short|RUNNING|None|2026-10-16T08:00:00|1|a"] * 5)),
+                               color=True, width=72)
+    assert "\x1b[32m" in good and "\x1b[31m" not in good           # GOOD is green, and nothing is red
+    ok = cli.render_standing(standing(standing_out(share=[r.replace("|0.132704|", "|0.4|") for r in SHARE_ROWS])), color=True, width=72)
+    assert "\x1b[33m" in ok                                        # OK is yellow
+
+
+@pytest.mark.parametrize("tty,env,expected", [
+    (False, {}, False), (True, {}, True), (True, {"NO_COLOR": "1"}, False),
+    (False, {"FORCE_COLOR": "1"}, True), (True, {"NO_COLOR": "1", "FORCE_COLOR": "1"}, False), (True, {"NO_COLOR": ""}, True)])
+def test_colour_is_for_terminals_unless_told_otherwise(tty, env, expected):
+    assert cli.use_color(tty, env) is expected
+
+
+@pytest.mark.parametrize("frac,filled", [(0, 0), (0.01, 1), (0.5, 10), (1, 20), (1.7, 20), (None, 0), (-1, 0)])
+def test_bars_fill_in_proportion_and_stay_inside_their_width(frac, filled):
+    b = cli.bar(frac, 20, True)
+    assert len(b) == 20 and b.count("█") == filled and b.count("░") == 20 - filled
+
+
+def test_the_command_colours_only_when_asked_to_and_brief_stays_one_line(inproc, monkeypatch, capsys):
+    inproc([])
+    monkeypatch.setattr(cli.Remote, "run", lambda self, cmd, retry=True: standing_out())
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    cli.main(["standing"])
+    assert "\x1b[" not in capsys.readouterr().out                  # a pipe or a test is not a terminal
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    cli.main(["standing"])
+    assert "\x1b[31m" in capsys.readouterr().out
+    cli.main(["standing", "--brief"])
+    brief = capsys.readouterr().out
+    assert len(brief.strip().splitlines()) == 1 and shown(brief).startswith("POOR — fair share POOR")
+    cli.main(["--json", "standing"])
+    assert "\x1b[" not in capsys.readouterr().out                  # json is never coloured
+
+
+@pytest.mark.parametrize("env,encoding,expected", [
+    ({}, "utf-8", True), ({"LANG": "en_US.UTF-8"}, "UTF-8", True), ({"LC_ALL": "C"}, "utf-8", False),
+    ({"LANG": "en_US.UTF-8", "LC_ALL": "POSIX"}, "utf-8", False), ({"LANG": "C", "LC_CTYPE": "en_GB.UTF-8"}, "utf-8", True),
+    ({"LANG": "en_US.ISO-8859-1"}, "ISO-8859-1", False), ({}, "ascii", False), ({}, None, False)])
+def test_unicode_is_used_only_when_the_locale_and_the_stream_can_show_it(env, encoding, expected):
+    """Python coerces a C locale to UTF-8 for its streams, so the stream's encoding alone proves nothing."""
+    assert cli.unicode_ok(env, encoding) is expected
+
+
+# ---- nuhpc standing: every queue, and how busy the whole cluster is ----
+
+def cluster(out=None, **thresholds):
+    return standing(out, **thresholds)["cluster"]
+
+
+def by_part(c):
+    return {p["partition"]: p for p in c["partitions"]}
+
+
+def without(out, *names):
+    """The remote output with whole sections left out, as when a query fails."""
+    keep, skip = [], False
+    for line in out.splitlines():
+        if line.startswith(M + " "):
+            skip = line[len(M) + 1:] in names
+        if not skip:
+            keep.append(line)
+    return "\n".join(keep) + "\n"
+
+
+def test_standing_lists_every_queue_with_its_cap_and_time_limit():
+    q = {p["partition"]: p for p in standing()["queue"]["partitions"]}
+    assert set(q) == {"short", "gpu", "gpu-short", "gpu-interactive", "sharing"}          # idle queues are listed too
+    assert (q["sharing"]["running"], q["sharing"]["pending"], q["sharing"]["cap"], q["sharing"]["limit_h"]) == (0, 0, 2, 1)
+    assert q["short"]["limit_h"] == 48 and q["gpu"]["limit_h"] == 8 and q["gpu-interactive"]["cap"] == 2
+    assert standing()["queue"]["label"] == "OK"                                              # idle queues change no verdict
+    odd = standing(standing_out(part=PART + ["PartitionName=odd QoS=N/A MaxTime=UNLIMITED "]))["queue"]["partitions"]
+    assert next(p for p in odd if p["partition"] == "odd")["cap"] is None and next(p for p in odd if p["partition"] == "odd")["limit_h"] is None
+
+
+def test_cluster_counts_running_waiting_and_held_jobs_per_queue():
+    c = by_part(cluster())
+    s = c["short"]
+    assert (s["running"], s["waiting"], s["held"]) == (3, 7, 4)       # an array of 4 is 4; dependency, hold, cap, start time are held
+    assert s["oldest_waiting_h"] == pytest.approx(12.0)
+    g, gs = c["gpu"], c["gpu-short"]
+    assert (g["running"], g["waiting"]) == (2, 2) and (gs["waiting"], gs["oldest_waiting_h"]) == (2, pytest.approx(1.0))   # waiting in two queues counts in both
+    assert (c["sharing"]["running"], c["sharing"]["waiting"], c["sharing"]["oldest_waiting_h"]) == (0, 0, None)
+
+
+def test_cluster_waits_count_only_starts_inside_the_window_from_when_a_job_became_eligible():
+    c = cluster()
+    assert c["window_h"] == 6 and by_part(c)["short"]["started"] == 6                 # the 3-day-old start and the pending row are out
+    assert by_part(c)["short"]["median_wait_min"] == 90 and by_part(c)["short"]["p90_wait_min"] == 300
+    assert by_part(c)["gpu"]["median_wait_min"] == pytest.approx(3.5) and by_part(c)["sharing"]["median_wait_min"] is None
+    wide = by_part(cluster(wait_window_h=100))["short"]
+    assert wide["started"] == 7 and wide["median_wait_min"] == 120                  # now the 3-day-old start is inside
+    held = standing_out(waits=[started("short", 5, ago_min=10, eligible="Unknown")])    # no eligible time: fall back to the submit time
+    assert by_part(cluster(held))["short"]["median_wait_min"] is None and by_part(cluster(held))["short"]["started"] == 1
+    many = standing_out(waits=[started("short", 5, ago_min=10 + i, eligible="Unknown") for i in range(5)])
+    assert by_part(cluster(many))["short"]["median_wait_min"] == 1005
+
+
+def test_cluster_labels_follow_the_median_wait_and_need_enough_starts():
+    c = cluster()
+    assert {p["partition"]: p["label"] for p in c["partitions"]} == {
+        "short": "OK", "gpu": "GOOD", "gpu-short": "unknown", "gpu-interactive": "GOOD", "sharing": "GOOD"}
+    assert c["label"] == "OK" and "short" in c["note"] and "1.5 h" in c["note"]
+    strict = cluster(cluster_wait_ok_min=10, cluster_wait_poor_min=80)
+    assert by_part(strict)["short"]["label"] == "POOR" and by_part(strict)["gpu"]["label"] == "GOOD" and strict["label"] == "POOR"
+    lenient = cluster(cluster_wait_ok_min=100)
+    assert by_part(lenient)["short"]["label"] == "GOOD" and lenient["label"] == "GOOD"
+
+
+def test_cluster_capacity_counts_busy_cores_and_free_gpus_on_usable_nodes():
+    c = by_part(cluster())
+    assert c["short"]["cores_busy_pct"] == pytest.approx(100 * 3157 / (3157 + 439))   # cores on down or drained nodes are not capacity
+    assert c["gpu"]["gpus"] == {"a100": {"total": 7, "used": 7, "free": 0}, "h200": {"total": 8, "used": 6, "free": 2},
+                                "t4": {"total": 4, "used": 0, "free": 4}}              # the down h200 node is not counted
+    assert c["gpu-short"]["gpus"] == c["gpu"]["gpus"] and c["sharing"]["gpus"] == {"l40s": {"total": 3, "used": 1, "free": 2}}
+    assert c["short"]["gpus"] == {}
+
+
+def test_cluster_load_never_changes_the_overall_verdict():
+    calm = ["short|RUNNING|None|2026-10-16T08:00:00|1|a"] * 5
+    s = standing(standing_out(share=[r.replace("|0.132704|", "|0.8|") for r in SHARE_ROWS], queue=calm),
+                 cluster_wait_ok_min=1, cluster_wait_poor_min=2)
+    assert s["cluster"]["label"] == "POOR" and s["overall"] == "GOOD" and s["brief"] == "fair share good 0.80, queue good"
+
+
+def test_cluster_is_unknown_when_a_query_fails_or_the_scheduler_hides_other_users():
+    full = standing_out()
+    for gone in ("waits", "cqueue"):
+        c = cluster(without(full, gone))
+        assert c["label"] == "unknown" and "unavailable" in c["note"], gone
+    only_me = standing_out(cqueue=[r.rsplit("|", 1)[0] + "|me.pi" for r in CQUEUE])
+    c = cluster(only_me)
+    assert c["label"] == "unknown" and "only your own jobs" in c["note"]
+    s = standing("")
+    assert s["cluster"]["label"] == "unknown" and s["cluster"]["partitions"] == [] and s["advice"] == []
+    assert "u1" not in json.dumps(standing()) and "u4" not in json.dumps(standing())          # other users are counted, never named
+
+
+def advice(out=None, **th):
+    return standing(out, **th)["advice"]
+
+
+def test_advice_is_empty_when_everything_is_good():
+    quick = [started("short", 5, ago_min=30 + 10 * i) for i in range(6)]
+    s = standing(standing_out(share=[r.replace("|0.132704|", "|0.8|") for r in SHARE_ROWS], gpus=[], waits=quick,
+                              queue=["short|RUNNING|None|2026-10-16T08:00:00|1|a"] * 5))
+    assert s["overall"] == "GOOD" and s["cluster"]["label"] == "GOOD" and s["advice"] == []
+
+
+def test_advice_follows_the_caps_the_fair_share_busy_queues_and_full_gpu_types():
+    assert [a["code"] for a in advice()] == ["fairshare", "gpu_full"]            # POOR fair share; no A100 is free; queue and cluster are OK
+    text = {a["code"]: a["text"] for a in advice()}
+    assert "a100" in text["gpu_full"] and "h200 2" in text["gpu_full"] and "t4 4" in text["gpu_full"]
+    assert "--time" in text["fairshare"] and "pilot" in text["fairshare"]
+    blocked = ["short|RUNNING|None|2026-10-16T08:00:00|1|a"] * 50 + ["short|PENDING|QOSMaxJobsPerUserLimit|2026-10-16T09:00:00|2|b"]
+    assert [a["code"] for a in advice(standing_out(queue=blocked))] == ["caps", "fairshare", "gpu_full"]
+    assert "--rows-per-job" in {a["code"]: a["text"] for a in advice(standing_out(queue=blocked))}["caps"]
+    busy = advice(cluster_wait_ok_min=10, cluster_wait_poor_min=80)
+    assert [a["code"] for a in busy] == ["fairshare", "busy_queue", "gpu_full"]
+    t = next(a["text"] for a in busy if a["code"] == "busy_queue")
+    assert "short" in t and "1.5 h" in t and "--time" in t and "resubmit" in t
+
+
+@pytest.mark.parametrize("minutes,text", [(45, "45 min"), (90, "1.5 h"), (300, "5 h"), (888, "14.8 h"), (2880, "2 d"), (6000, "4.17 d")])
+def test_durations_read_in_the_unit_that_fits(minutes, text):
+    assert cli.fmt_dur(minutes) == text
+
+
+def test_the_wait_window_and_thresholds_come_from_the_standing_table():
+    assert cli.standing_thresholds({})["wait_window_h"] == 6 and cli.standing_thresholds({})["cluster_wait_poor_min"] == 120
+    assert cli.standing_thresholds({"standing": {"wait_window_h": 12}})["wait_window_h"] == 12
+    assert "now-360minutes" in cli.standing_query() and "now-120minutes" in cli.standing_query(2)
+
+
+def test_standing_remote_shell_also_reads_the_whole_cluster(tmp_path):
+    stubs = {
+        "sacctmgr": 'case "$*" in *assoc*) echo lab.pi;; esac',
+        "scontrol": 'case "$*" in *partition*) echo "PartitionName=short QoS=short MaxTime=2-00:00:00";; esac',
+        "squeue": 'case "$*" in *--me*) ;; *-a*) printf "short|RUNNING|None|2026-10-16T08:00:00|6|u8\\nshort|PENDING|Priority|2026-10-16T09:00:00|5|u9\\n";; esac',
+        "sinfo": 'case "$*" in *%C*) echo "short|10/90/0/100";; *-N*) echo "gpu g1 mixed gpu:a100:4(S:0-1) gpu:a100:1(IDX:0)";; esac',
+        "sacct": 'case "$*" in *-a*) for i in 1 2 3 4 5; do echo "short|2026-10-16T08:00:00|2026-10-16T09:40:00|2026-10-16T09:50:00"; done;; esac',
+        "date": "echo 2026-10-16T10:00:00"}
+    env = {**os.environ, "USER": "me.pi", "PATH": f"{stub_bin(tmp_path, **stubs)}:{os.environ['PATH']}"}
+    p = subprocess.run(["bash", "-c", cli.standing_query()], capture_output=True, text=True, env=env)
+    assert p.returncode == 0, p.stderr
+    c = cli.parse_standing(p.stdout, {})["cluster"]
+    short = by_part(c)["short"]
+    assert (short["running"], short["waiting"], short["started"], short["median_wait_min"]) == (1, 1, 5, 10)   # eligible 09:40, started 09:50
+    assert short["cores_busy_pct"] == pytest.approx(10.0)
+    assert "u9" not in json.dumps(cli.parse_standing(p.stdout, {}))
+    assert not any(w in cli.standing_query() for w in ("scancel", "sbatch", "srun", "scontrol update", "kill"))
+
+
+def test_standing_json_carries_the_cluster_and_the_advice(inproc, monkeypatch, capsys):
+    inproc([])
+    seen = []
+    monkeypatch.setattr(cli.Remote, "run", lambda self, cmd, retry=True: seen.append(cmd) or standing_out())
+    cli.main(["--json", "standing"])
+    d = json.loads(capsys.readouterr().out)
+    assert d["cluster"]["label"] == "OK" and d["advice"][0]["code"] == "fairshare" and "now-360minutes" in seen[0]
+    assert d["brief"] == "fair share poor 0.13, queue ok"                              # the morning line is unchanged
+
+
+# ---- nuhpc standing: how the cluster section looks ----
+
+def test_report_has_every_queue_a_cluster_section_and_advice():
+    lines = render(width=100).splitlines()
+    assert any(l.strip().startswith("sharing") and "0 of 2 running" in l and "1 h max" in l for l in lines)
+    assert any(l.strip().startswith("short") and "2 of 50 running" in l and "2 d max" in l for l in lines)
+    assert any(l.startswith("─") and " Cluster " in l for l in lines)
+    i = next(i for i, l in enumerate(lines) if l.strip().startswith("short") and "busy" in l)
+    assert all(x in lines[i] for x in ("88% busy", "OK", "7 waiting", "4 held"))
+    assert lines[i + 1].strip() == "median wait 1.5 h · slowest tenth 5 h · oldest waiting 12 h"
+    j = next(i for i, l in enumerate(lines) if l.strip().startswith("gpu-short") and "busy" in l)
+    assert "unknown" in lines[j] and lines[j + 1].strip() == "only 3 jobs started in the last 6 h · oldest waiting 1 h"
+    k = next(i for i, l in enumerate(lines) if l.strip().startswith("sharing") and "busy" in l)
+    assert lines[k + 1].strip() == "no job started in the last 6 h"
+    g = next(i for i, l in enumerate(lines) if l.strip().startswith("free GPUs") and "gpu · gpu-interactive · gpu-short" in l)
+    assert lines[g + 1].strip() == "a100 0 of 7 · h200 2 of 8 · t4 4 of 4"
+    assert any(l.strip().startswith("free GPUs") and l.strip().endswith("sharing") for l in lines) and any(l.strip() == "l40s 2 of 3" for l in lines)
+    assert any(l.strip().startswith("status") and "OK · short median wait 1.5 h" in l for l in lines)
+    assert any(l.startswith("─") and " Advice " in l for l in lines) and any("pilot" in l for l in lines)
+
+
+def test_gpu_types_are_coloured_by_how_many_are_free():
+    coloured = render(color=True, width=100)
+    assert "\x1b[31ma100 0 of 7" in coloured and "\x1b[33mh200 2 of 8" in coloured and "\x1b[32mt4 4 of 4" in coloured
+
+
+def test_a_good_standing_has_no_advice_section():
+    quick = [started("short", 5, ago_min=30 + 10 * i) for i in range(6)]
+    s = standing(standing_out(share=[r.replace("|0.132704|", "|0.8|") for r in SHARE_ROWS], gpus=[], waits=quick,
+                              queue=["short|RUNNING|None|2026-10-16T08:00:00|1|a"] * 5))
+    assert " Advice " not in cli.render_standing(s, width=100)
+
+
+def test_the_cluster_section_survives_missing_data():
+    s = standing(without(standing_out(), "waits", "cqueue", "cores", "gpus"))
+    text = cli.render_standing(s, width=72)
+    assert "Cluster" in text and "unknown" in text
+    assert all(len(shown(l)) <= 72 for l in cli.render_standing(s, color=True, width=72).splitlines())
+
+
+def test_queue_and_cluster_rows_line_up_whatever_the_queue_names_are():
+    for width in (72, 100):
+        lines = render(width=width).splitlines()
+        rows = [l for l in lines if re.match(r"  (short|gpu|gpu-short|gpu-interactive|sharing) ", l) and any(c in l for c in "█░")]
+        cols = {next(i for i, c in enumerate(l) if c in "█░") for l in rows}
+        assert len(rows) == 10 and len(cols) == 1, (width, cols)             # five queues, listed twice, gauges in one column
+
+
+def test_advice_says_whether_it_calls_for_a_plan_or_is_only_a_note():
+    blocked = ["short|RUNNING|None|2026-10-16T08:00:00|1|a"] * 50 + ["short|PENDING|QOSMaxJobsPerUserLimit|2026-10-16T09:00:00|2|b"]
+    kinds = {a["code"]: a["kind"] for a in advice(standing_out(queue=blocked), cluster_wait_ok_min=10, cluster_wait_poor_min=80)}
+    assert kinds == {"caps": "plan", "fairshare": "plan", "busy_queue": "plan", "gpu_full": "note"}   # a full GPU type changes the choice, not the bill
+
+
+def test_gpu_advice_names_only_the_few_types_that_matter():
+    full = [f"{'sharing':<16} nf{i} mixed gpu:f{i}:2 gpu:f{i}:2(IDX:0-1)" for i in range(1, 5)]
+    free = [f"{'sharing':<16} ng{g} mixed gpu:g{g}:8 gpu:g{g}:{8 - n}(IDX:0)" for g, n in zip(range(1, 7), (6, 5, 4, 3, 2, 1))]
+    text = next(a["text"] for a in advice(standing_out(gpus=full + free)) if a["code"] == "gpu_full")
+    assert "No free f1, f2, f3 (+1 more) GPU on sharing" in text
+    assert "Free now: g1 6, g2 5, g3 4, g4 3 (+2 more)" in text and "g5" not in text
+
+
+def test_a_long_detail_line_continues_on_the_next_line_instead_of_being_cut_off():
+    text = render(width=72)
+    assert "oldest waiting 12 h" in text and "slowest tenth 5 h" in text and "…" not in text
+    wide = render(width=100)
+    assert "median wait 1.5 h · slowest tenth 5 h · oldest waiting 12 h" in wide           # when it fits it stays on one line
+
+
+# ---- usage: what was allocated and not used, for the skill's waste check ----
+
+def test_usage_totals_say_how_much_of_what_was_allocated_went_unused(inproc, monkeypatch, tmp_path, capsys):
+    """Fixture: one GPU task sampled at 63.5% and one OOM GPU task (billed 18 of 72 hours; a GPU-hour counts as 100 CPU-hours).
+    Cores are judged on CPU-only tasks, since a GPU job's cores are incidental, so there is nothing to report here."""
+    usage_transport(monkeypatch, USAGE_REPLY)
+    (tmp_path / "results/r1-20260101-000000").mkdir(parents=True)
+    cli.main(["--json", "usage", "r1"])
+    out = json.loads(capsys.readouterr().out)
+    t = out["totals"][-1]
+    assert t["project"] == "all" and t["gpu_idle_%"] == 36.5 and t["failed_%"] == 25.0 and t["cpu_idle_%"] == "-"
+    assert out["runs"][0]["cpu_idle_%"] == "-"
+
+
+def task(**kw):
+    return {"cpu_eff": None, "cpu_hours": 0.0, "gpus": 0, "gpu_util_mean": None, "gpu_hours": 0.0, "state": "COMPLETED", **kw}
+
+
+def test_waste_weights_each_task_by_its_hours_and_judges_cores_on_cpu_only_tasks():
+    tasks = [task(cpu_hours=4.0, cpu_eff=0.5),                                                        # 2 of 4 core-hours used
+             task(cpu_hours=1.0, cpu_eff=0.0, state="FAILED"),                                        # none of 1 used, and lost
+             task(cpu_hours=2.0, cpu_eff=0.0, gpus=1, gpu_hours=0.5, gpu_util_mean=60.0),             # a GPU job: its idle cores don't count
+             task(cpu_hours=1.0, cpu_eff=0.9, gpus=1, gpu_hours=0.25, state="TIMEOUT")]               # no GPU samples: not in the GPU figure
+    w = cli.waste(tasks)
+    assert w["cpu_idle_%"] == 60.0                       # (4 + 1 - 2) / 5 core-hours
+    assert w["gpu_idle_%"] == 40.0                       # one sampled task at 60%
+    assert w["failed_%"] == 32.5                         # (1 + 26) of (4 + 1 + 52 + 26) billed hours
+    assert cli.waste([task(cpu_hours=2.0, cpu_eff=0.5, gpus=1, gpu_hours=1.0, gpu_util_mean=50.0)])["cpu_idle_%"] == "-"
+
+
+def test_waste_is_dashes_when_nothing_can_be_measured():
+    assert cli.waste([]) == {"cpu_idle_%": "-", "gpu_idle_%": "-", "failed_%": "-"}
+    assert cli.waste([task(state="CANCELLED")]) == {"cpu_idle_%": "-", "gpu_idle_%": "-", "failed_%": "-"}      # nothing billed, nothing lost

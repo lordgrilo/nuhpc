@@ -171,7 +171,7 @@ Locally: the config is `~/.config/nuhpc/config.toml`, the ledger, staged jobs an
 - `~/nuhpc-results/<run_id>/usage.json`: beside the results, once fetched (the CSVs come along in `usage/`).
 - `~/.nuhpc/usage/` in your cluster login home: outside every work root, so cleaning `runs/` keeps it, and shared by every machine that submits as you.
 
-`nuhpc usage [RUN...] [--since 7d|all] [--project P]` prints one row per finished run and totals per project; the first call also records any older run that lacks a record (the GPU columns stay empty for runs from before the sampler). `mem_%` is Slurm's peak memory over the request, and can pass 100 % without an out-of-memory kill: a model download on Explorer showed 168 %. Tag runs with `submit --project P` (or `run --project P`) to make the per-project totals mean something. If the cluster can't be reached when a run is first seen finished, the command warns `usage not recorded` and carries on; the next `wait`, `fetch` or `usage` records the run from Slurm's accounting, so nothing is lost.
+`nuhpc usage [RUN...] [--since 7d|all] [--project P]` prints one row per finished run and totals per project, with the share of what was allocated that went unused: `cpu_idle_%` (core-hours that sat idle, on CPU-only tasks, since a GPU job's cores are incidental), `gpu_idle_%` (sampled GPU-hours that sat idle) and `failed_%` (billed hours spent on tasks that did not complete, a GPU-hour counted as about 100 CPU-hours, which is an estimate). All are weighted by hours; the first call also records any older run that lacks a record (the GPU columns stay empty for runs from before the sampler). `mem_%` is Slurm's peak memory over the request, and can pass 100 % without an out-of-memory kill: a model download on Explorer showed 168 %. Tag runs with `submit --project P` (or `run --project P`) to make the per-project totals mean something. If the cluster can't be reached when a run is first seen finished, the command warns `usage not recorded` and carries on; the next `wait`, `fetch` or `usage` records the run from Slurm's accounting, so nothing is lost.
 
 **Cleaning up.** Run folders stay in `runs/` until you delete them: a few KB of logs for a test, MB of outputs for an experiment. `fetch` what you keep, then delete old runs yourself:
 
@@ -192,7 +192,7 @@ Most waits and failures on Explorer come from how a submit is shaped, not from t
 | `gpu` | 4 | 8 | 4, one per job | 4 h / 8 h |
 | `sharing` | 2 | 4 | 2 | 1 h |
 
-**Every array task counts as a job**, in both the running and the queued column. So 48 one-CPU tasks hold 48 of your 50 `short` slots while using about 5% of your core allowance, and everything else you submit waits behind them. A job also waits for a node that fits it: most `short` nodes have 20 cores and about 62 GB (roughly 3 GB per core), and only about a dozen have more (28 cores with 256 GB, 48 with 126 GB, one with 128 and 512 GB), so a job that asks for more than a typical node can only run on those. And the scheduler's biggest priority term is fair share, computed from the recent use of your Slurm account (half-life 7 days). A PI's account is usually shared by the whole lab, and every member of it gets the same fair-share factor, so a heavy burst by anyone in the account slows what everyone in it submits next. Billing weighs a GPU-hour at roughly 100 CPU-hours, so GPU time dominates it: packing CPU rows fixes the running-job cap, but only less GPU use moves fair share. `sshare -a -u <user>` and `sprio -u <user>` (run from a job, as nuhpc has no verb for them) show the account's standing and your pending jobs' priority.
+**Every array task counts as a job**, in both the running and the queued column. So 48 one-CPU tasks hold 48 of your 50 `short` slots while using about 5% of your core allowance, and everything else you submit waits behind them. A job also waits for a node that fits it: most `short` nodes have 20 cores and about 62 GB (roughly 3 GB per core), and only about a dozen have more (28 cores with 256 GB, 48 with 126 GB, one with 128 and 512 GB), so a job that asks for more than a typical node can only run on those. And the scheduler's biggest priority term is fair share, computed from the recent use of your Slurm account (half-life 7 days). A PI's account is usually shared by the whole lab, and every member of it gets the same fair-share factor, so a heavy burst by anyone in the account slows what everyone in it submits next. Billing weighs a GPU-hour at roughly 100 CPU-hours, so 11,000 CPU-hours in a day count like about 110 GPU-hours: fair share follows the total billed use, whichever kind it is, and packing rows fixes the running-job cap without changing it (the same hours are used). Only using less moves it. `nuhpc standing` shows where you are.
 
 Rules that follow:
 
@@ -204,6 +204,75 @@ Rules that follow:
 - **Home** has a 75 GB quota; keep environments and caches on project storage (`nuhpc` builds them there).
 
 nuhpc enforces the first rule. A submit of more than `limits.small_task_max` (default 16) array tasks of at most `small_task_cpus` (2) CPUs and no GPU is refused unless it is packed or given `--confirm-big`, and from `small_task_warn` (8) tasks it warns. `limits.big_job_cpus` and `big_job_mem` (20 and "60G" in the example config) make it warn when one CPU job is bigger than a typical CPU node; GPU jobs are not judged by them, as GPU nodes are much bigger. Warnings are printed to stderr and listed under `warnings` in the JSON result.
+
+### Where you stand: `nuhpc standing`
+
+One read-only call to the login node (no job, about 15 seconds) that reports your queues, how busy the whole cluster is, and your account's fair share, with a verdict about you. On a terminal it is coloured (GOOD green, OK yellow, POOR red) with gauges, in the look of `npl`:
+
+```
+Explorer standing · cluster time 2026-10-16 10:00
+
+  [OK]  fair share ok 0.31 · queue good
+  me.pi · account lab.pi · 4 users
+
+──────────────────────────────── Queue ─────────────────────────────────
+  gpu              ░░░░░░░░  0 of 4 running   0 pending · 8 h max
+  gpu-interactive  ░░░░░░░░  0 of 2 running   0 pending · 2 h max
+  gpu-short        ░░░░░░░░  0 of 2 running   0 pending · 2 h max
+  sharing          ░░░░░░░░  0 of 2 running   0 pending · 1 h max
+  short            █░░░░░░░  6 of 50 running  0 pending · 2 d max
+  status           GOOD · no cap pressure
+
+─────────────────────────────── Cluster ────────────────────────────────
+  gpu              ████░░░░  52% busy  GOOD    2 waiting
+                   median wait 4 min · slowest tenth 5 min
+                   oldest waiting 2 h
+  gpu-interactive  ████░░░░  52% busy  GOOD    0 waiting
+                   no job started in the last 6 h
+  gpu-short        ████░░░░  52% busy  unknown 2 waiting
+                   only 3 jobs started in the last 6 h
+                   oldest waiting 1 h
+  sharing          ████░░░░  55% busy  GOOD    0 waiting
+                   no job started in the last 6 h
+  short            ███████░  88% busy  OK      7 waiting · 4 held
+                   median wait 1.5 h · slowest tenth 5 h
+                   oldest waiting 12 h
+  free GPUs        gpu · gpu-interactive · gpu-short
+                   a100 0 of 7 · h200 2 of 8 · t4 4 of 4
+  free GPUs        sharing
+                   l40s 2 of 3
+  status           OK · short median wait 1.5 h
+
+────────────────────────────── Fair share ──────────────────────────────
+  factor     ██████░░░░░░░░░░░░░░ 0.312   good ≥ 0.5 · ok ≥ 0.25
+  usage      3.8x its equal share · 2 of 5 accounts use more
+  recovery   about 13 days of no use to reach 1x (half-life 7 d)
+  account    you █████░░░░░░░░░░░░░░░ 23% · the other 3 users 77%
+  priority   fair share gives a new job 6,240 of 20,000 points
+
+──────────────────────────────── Advice ────────────────────────────────
+  - Fair share is OK (0.31) and jobs are billed on what they allocate:
+    size CPUs and memory from a pilot's measured use, set --time near
+    the measured runtime, and pilot before any large submit.
+  - No free a100 GPU on gpu, gpu-interactive, gpu-short: a job asking
+    for it will wait. Free now: t4 4, h200 2.
+
+  --users names the others · --brief one line · --json for scripts
+```
+
+- **Queue** lists every partition you can use, idle ones too, with your running jobs against its live cap (read from the scheduler, not hard-coded) and its time limit. `POOR` means a cap is holding jobs back (`QOSMax...` reasons; your own `--max-parallel` throttle does not count), `OK` means you are near a cap (80%) or jobs have waited over 6 h, `GOOD` means neither.
+- **Cluster** shows how loaded each queue is for everyone, not only you: the share of usable cores that are busy, the jobs waiting on the scheduler (as opposed to held by a dependency, a hold, a cap or a start time), the median and slowest-tenth wait of the jobs that started in the last 6 hours (counted from when each became eligible), the oldest job still waiting, and the free GPUs by type. A queue is `GOOD` under 30 minutes of median wait, `OK` under 2 hours and `POOR` beyond, and `unknown` when fewer than 5 jobs started. It never changes the overall verdict, since you cannot fix it; it changes the advice. Other people's jobs are counted, never named, and if the scheduler hides them (only your own jobs show) the section says so instead of guessing. The waits cover only jobs that have started, so they understate the worst case; the oldest-waiting figure is there to correct for that, and array tasks held back by their own `%N` limit count as waiting.
+- **Fair share** is the account's, so it is the lab's. `GOOD` is a factor of 0.5 or more, `OK` 0.25 or more, `POOR` below that. The report shows how your account's use compares with its equal share, its rank among all accounts, and how the account's use splits between you and the rest (names only with `--users`).
+- The overall verdict is the worse of queue and fair share. A `POOR` fair share costs nothing while the cluster has free resources; it shows as longer waits for scarce GPUs.
+- **Advice** appears when something should change: a cap holding jobs back (pack rows), a `POOR` or `OK` fair share (right-size, pilot, set `--time` from measurements), a busy queue (ask for a shorter `--time`; do not cancel and resubmit) and GPU types with no free card. In the JSON each item is `{code, kind, text}`; `kind` is `plan` when how you use the cluster has to change and `note` when it only affects what to ask for.
+- `--brief` prints just the verdict line; `--json` has everything, including a short `brief` string for status lines. The cut-offs are in an optional `[standing]` table of the config: `wait_hours`, `near_cap`, `fairshare_good`, `fairshare_low`, `wait_window_h`, `cluster_wait_ok_min`, `cluster_wait_poor_min`. Piped, redirected or with `NO_COLOR` set it is plain text, `FORCE_COLOR=1` colours it anyway (for a pager), and a non-UTF-8 locale gets an ASCII form.
+
+**Improving fair share.** It is computed from what your account's jobs *allocate*, in billed CPU-hours (a GPU-hour counts about 100), and the usage halves every 7 days. So:
+
+- **Right-size the CPUs and GPUs you ask for.** Cores that sit idle are billed like busy ones: `nuhpc usage` shows `cpu_idle_%` per run and per project (and `cpu_eff` per task in the record), and a job that asks for 16 CPUs and uses 30% of them is billed three times what it needed. Pilot with fewer cores and compare the runtime.
+- **Don't pay twice for the same result.** Failed, timed-out and cancelled tasks are billed for the hours they ran: pilot first, set `--time` at about 1.5 times the slowest measured task, and write results as you go.
+- **Let it decay, and spread bursts.** A burst keeps the account above its share for weeks; nothing you do afterwards removes it earlier, but not repeating it lets it halve each week. Packing rows and moving jobs to quiet hours do not change the bill (they do avoid waiting).
+- **It is shared.** Everyone in the account has the same factor, so a heavy member sets it for the lab; `nuhpc standing --users` shows who. Whether a larger share or a group allocation is available is a question for Research Computing.
 
 ## Workflows
 
@@ -288,9 +357,10 @@ Model size drives queue time more than anything else: one A100-80GB or H200 job 
 | `nuhpc wait RUN... [--timeout S]` | block until the runs finish, polling with backoff and riding out network drops; prints final states and the log tail of the first failed task (exit 3 on timeout) |
 | `nuhpc logs RUN [--task i] [-n N] [--grep RE]` | tail a task's log, or only the lines matching RE across the whole log |
 | `nuhpc fetch RUN [--include '*.json'] [--max-size 500M]` | rsync `outputs/` and `logs/` (and the GPU samples in `usage/`) to `local_results/<run_id>` |
-| `nuhpc usage [RUN...] [--since 7d\|all] [--project P]` | compute used vs requested per finished run, totals per project (see Usage) |
+| `nuhpc usage [RUN...] [--since 7d\|all] [--project P]` | compute used vs requested per finished run, totals per project, with idle and failed shares (see Usage) |
 | `nuhpc cancel RUN [--task i]` | `scancel` a whole run or one array task |
 | `nuhpc runs` / `nuhpc queue` | local ledger / your jobs in `squeue` |
+| `nuhpc standing [--users] [--brief]` | your queues against the live caps, how busy the cluster is (waits, load, free GPUs), and your account's fair share, with a GOOD / OK / POOR verdict and advice (see Where you stand) |
 | `nuhpc push LOCAL [REL] [--project P] [--globus]` | upload data to `<work root>/data/REL` |
 | `nuhpc pull REL [LOCAL] [--project P] [--globus]` | download a path relative to the work root |
 | `nuhpc ls [REL] [--project P]` | list a directory under the work root |
@@ -352,6 +422,7 @@ To add your own templates, drop `*.sbatch` files into `templates_dir`. Lines sta
        "allow": ["Bash(nuhpc:*)"],
        "deny":  ["Bash(ssh:*)", "Bash(scp:*)", "Bash(rsync:*)", "Bash(sftp:*)"] } }
    ```
+   The skill also tells the agent what to do when `nuhpc standing` reports a poor standing: measure the waste with `nuhpc usage`, write a cost plan (right-size, bundle, pilot first) and get your acceptance before any heavy submit. That is an instruction to the agent; no `nuhpc` command refuses a submit because of your standing.
    Honest caveat: prefix rules can't block `--confirm-big` appearing in the middle of a command. The limits are a guardrail backed by the skill's instructions, not a security boundary. For a hard boundary, give the agent a config with stricter limits and remove the flag from your installed copy.
 3. **Delayed or unattended runs.** Schedule a headless run on a machine that stays on, since a sleeping laptop pauses everything:
    ```bash
