@@ -52,6 +52,22 @@ def _list_dir(path: str, keep: int, names: bool) -> dict:
             "top": sorted(heap, reverse=True), "unreadable": unreadable}
 
 
+def _filesystem(root: str) -> dict:
+    """How full the filesystem holding `root` is, as `df` would say (sizes in bytes), and where it is mounted. On a cluster with
+    directory quotas, `df` inside a group's folder shows the quota; `parent` then holds the size of the whole mount."""
+    st = os.statvfs(root)
+    mount = root
+    while mount != os.sep and not os.path.ismount(mount):
+        mount = os.path.dirname(mount)
+    fs = {"mount": mount, "total": st.f_blocks * st.f_frsize, "used": (st.f_blocks - st.f_bfree) * st.f_frsize,
+          "avail": st.f_bavail * st.f_frsize}
+    top = os.statvfs(mount)
+    if top.f_blocks * top.f_frsize != fs["total"]:      # the root sits under a quota: the mount is the bigger pool beneath it
+        fs["parent"] = {"total": top.f_blocks * top.f_frsize, "used": (top.f_blocks - top.f_bfree) * top.f_frsize,
+                        "avail": top.f_bavail * top.f_frsize}
+    return fs
+
+
 def scan(root: str, depth: int = 4, names: bool = True, workers: int = 16, per_dir: int = 8, largest: int = 25,
          budget_s: float | None = None) -> dict:
     """Walk `root` and return the result as a dict (see the module docstring). With `budget_s`, folders not yet
@@ -123,7 +139,7 @@ def scan(root: str, depth: int = 4, names: bool = True, workers: int = 16, per_d
     return {"version": 1, "root": root, "host": socket.gethostname(), "depth": depth, "names": names, "workers": workers,
             "scanned_at": int(now), "scanned": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)),
             "elapsed_s": round(time.monotonic() - started, 1), "n_dirs": len(info),
-            "partial": unscanned > 0, "unscanned": unscanned, "unreadable": total[root]["bad"],
+            "partial": unscanned > 0, "unscanned": unscanned, "unreadable": total[root]["bad"], "fs": _filesystem(root),
             "tree": node(root, 0),
             "largest": ([{"path": os.path.relpath(p, root), "bytes": size, "mtime": mtime}
                          for size, p, mtime in sorted(biggest, reverse=True)] if names else [])}

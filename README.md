@@ -288,6 +288,9 @@ nuhpc disk --scan --job    # the full scan as a short compute-node job: adds fil
 ```
  nuhpc disk · /projects/lab/you
  scanned 2 min ago · ≥ 682 G · quick scan · partial (1 folder not fully read)
+ /projects quota  ███████▋░░░░░░░░░░░░ 38% full · 9.9 T free of 16 T
+  this folder is ≥ 4.2% of it, and ≥ 11% of what is used
+  the filesystem under it is 94% full: 3.3 P of 3.5 P
  you
 
 ❯  1  ████████████▎░   87.9%  models/                                           600 G   11 d
@@ -301,6 +304,7 @@ nuhpc disk --scan --job    # the full scan as a short compute-node job: adds fil
 
 Keys: up and down (or `j` and `k`) move, Enter or right opens a folder, Backspace or left goes back to where you were, `s` sorts by size or by age (the stalest first, for clearing out), `l` lists the largest files (full scans only; Enter shows the folder one lives in), `q` quits. Piped, or with `--print`, it prints the report once; `--json` prints the scan.
 
+- **How full the disk is.** Below the title, the explorer shows the filesystem the folder lives on: a bar with how full it is, what is free, and how much of it this folder takes. On a cluster with directory quotas, `df` inside a group's folder reports the group's quota (on Explorer, each group's top folder has its own: 16 T for one lab, 35 T for another), so that is what the bar shows, labelled `quota`; a further line then says how full the whole filesystem under it is. Both come from `df`, which costs nothing.
 - **The quick scan is not a job.** `--scan` runs `du` on the login node: a small script goes over ssh on stdin and runs six `du` at a time, one per folder two levels down, each at the lowest priority and all inside a time cap (`--budget`, 60 s by default). Nothing is written on the cluster. Folders `du` does not finish inside the cap show as `not read`, and the folders above them as lower bounds (`≥ 7.84 G`, as in the sample, where `envs` was cut off), with a note saying so; raise the cap, or use `--job`. It gives sizes and ages, not file counts or file names.
 - **Why `du`, and why capped.** On project storage a single reader gets through about 800 files a second, so a folder of hundreds of thousands of small files (a Python environment) takes minutes. Login nodes allow each user a fraction of one core and kill processes that use more: a multi-threaded scanner written in Python was killed about half the time there, while `du`, which mostly waits on the file server, was not. Hence several `du` in parallel and a hard cap, rather than one clever walker.
 - **The full scan: `--job`.** The `disk_scan` template runs a read-only walk with 16 parallel readers on a compute node (4 CPUs, 30 minutes at most, so under 2 CPU-hours, and it appears in `nuhpc usage`); it queues like any job. It adds file counts, the 8 largest files of each folder and the 25 largest overall, counts unreadable folders, and reports a partial result if it runs out of time. If `--job` times out while still queued it exits with status 3 and the run id; `nuhpc wait RUN` and then `nuhpc disk --collect RUN` bring the result in.

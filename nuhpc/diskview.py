@@ -284,6 +284,20 @@ class Explorer:
                       *([(f" {sep} quick scan", "dim")] if s.get("mode") == "quick" else []),
                       *([(f" {sep} partial ({s.get('unscanned', 0)} folder{'s' if s.get('unscanned', 0) != 1 else ''} not fully read)", "peach")] if s.get("partial") else []),
                       *([(f" {sep} {s['unreadable']} unreadable", "rose")] if s.get("unreadable") else []))]
+        fs = s.get("fs")
+        if fs and fs.get("total"):                              # how full the whole disk is, and this folder's share of it
+            frac = fs["used"] / fs["total"]
+            colour = "mint" if frac < 0.70 else "lemon" if frac < 0.85 else "peach" if frac < 0.95 else "rose"
+            head.append(P.row(" ", (fs["mount"] + (" quota" if fs.get("parent") else ""), "lavender"), "  ", (hbar(frac, 20 if width >= 72 else 12, uni), colour), f" {frac * 100:.0f}% full",
+                              (f" {sep} {fmt_size(fs['avail'])} free of {fmt_size(fs['total'])}", "dim")))
+            lower = ("≥ " if uni else ">= ") if t.get("incomplete") else ""
+            used = f", and {lower}{100 * t['bytes'] / fs['used']:.0f}% of what is used" if fs.get("used") else ""
+            head.append(P.row("  ", (f"this folder is {lower}{100 * t['bytes'] / fs['total']:.1f}% of it{used}", "dim")))
+            pool = fs.get("parent")
+            if pool and pool.get("total"):                  # the quota sits inside a bigger filesystem: how full is that?
+                pf = pool["used"] / pool["total"]
+                head.append(P.row("  ", ("the filesystem under it is ", "dim"), (f"{pf * 100:.0f}% full", "mint" if pf < 0.70 else "lemon" if pf < 0.85
+                                 else "peach" if pf < 0.95 else "rose"), (f": {fmt_size(pool['used'])} of {fmt_size(pool['total'])}", "dim")))
         if self.view == "largest":
             head.append(P.row(" ", ("largest files", "bold"), (f" {sep} biggest {len(s.get('largest', []))} in the scan", "dim")))
         else:

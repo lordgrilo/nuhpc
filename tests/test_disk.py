@@ -761,3 +761,112 @@ def test_a_quick_dry_run_prints_the_command_and_changes_nothing(inproc, monkeypa
     node = LoginNode(monkeypatch)
     cli.main(["--dry-run", "disk", "--scan"])
     assert not (tmp_path / "state/disk").exists()
+
+
+# ---- the whole disk: how full the filesystem is, and what share of it this folder is ----
+
+FS = {"name": "server:/work", "mount": "/projects", "total": 16 * 1024 * G, "used": 5 * 1024 * G + 920 * M * 1024 // 1024, "avail": 9 * 1024 * G + 700 * M * 1024 // 1024}
+
+
+def with_fs(**kw):
+    fs = {**FS, **kw}
+    return {**SCAN, "fs": fs}
+
+
+def test_the_job_scanner_reports_how_full_the_filesystem_is(tmp_path):
+    s = diskscan.scan(str(make(tmp_path / "r", TREE)), depth=1)
+    fs = s["fs"]
+    assert fs["total"] > 0 and 0 <= fs["used"] <= fs["total"] and 0 <= fs["avail"] <= fs["total"]
+    assert os.path.isdir(fs["mount"]) and str(tmp_path / "r").startswith(fs["mount"])           # the mount the root lives on
+
+
+def test_the_quick_script_asks_df_for_the_mount_and_its_record_is_read_back():
+    script = diskquick.quick_script("/r", depth=4, budget=60)
+    assert "df -P -B1" in script and script.index("df -P") < script.index("exit 0")
+    q = quick("S\tserver:/work\t17592186044416\t6319245000000\t10400000000000\t/projects\n" + QUICK)
+    assert q["fs"] == {"name": "server:/work", "total": 17592186044416, "used": 6319245000000, "avail": 10400000000000, "mount": "/projects"}
+    assert "fs" not in quick()                                                                  # no record, no claim
+    assert "fs" not in quick("S\tserver\tnot-a-number\t1\t2\t/x\n" + QUICK)
+
+
+def test_the_header_shows_how_full_the_disk_is_and_this_folders_share_of_it():
+    ex = diskview.Explorer(with_fs(), now=NOW)
+    lines = lines_of(ex)
+    assert lines[2].strip().startswith("/projects") and "█" in lines[2] and "% full" in lines[2]
+    used_pct = 100 * FS["used"] / FS["total"]
+    assert f"{used_pct:.0f}% full" in lines[2] and f"{fmt_size_local(FS['avail'])} free of 16 T" in lines[2]
+    share = 100 * ETREE["bytes"] / FS["total"]
+    assert f"{share:.1f}%" in lines[3] and "of it" in lines[3] and "of what is used" in lines[3]
+    assert lines[4].strip() == "me"                                                               # the breadcrumb moves down two lines
+    assert lines_of(diskview.Explorer(SCAN, now=NOW))[2].strip() == "me"                          # no fs, no extra lines
+
+
+def fmt_size_local(n):
+    return diskview.fmt_size(n)
+
+
+def test_a_lower_bound_folder_share_says_at_least_and_fullness_is_coloured():
+    quick_scan = {**quick(), "fs": {**FS}}
+    text = "\n".join(lines_of(diskview.Explorer(quick_scan, now=1790001000)))
+    assert "≥" in next(l for l in text.splitlines() if "of it" in l)
+    def bar_colour(pct):
+        total = 1000 * G
+        fs = {**FS, "total": total, "used": int(total * pct / 100), "avail": int(total * (100 - pct) / 100)}
+        return diskview.Explorer({**SCAN, "fs": fs}, now=NOW).frame(width=100, color=True).splitlines()[2]
+    assert "\x1b[38;5;158m" in bar_colour(40) and "\x1b[38;5;229m" in bar_colour(75)               # mint, then lemon
+    assert "\x1b[38;5;223m" in bar_colour(90) and "\x1b[38;5;211m" in bar_colour(97)               # peach, then rose
+
+
+def test_the_disk_lines_fit_every_width_and_the_ascii_form():
+    for width in (50, 72, 100):
+        ex = diskview.Explorer(with_fs(), now=NOW)
+        assert all(len(shown(l)) <= width for l in ex.frame(width=width, color=True).splitlines()), width
+    assert all(ord(c) < 128 for c in diskview.Explorer(with_fs(), now=NOW).frame(width=80, uni=False))
+
+
+def test_the_command_caches_and_shows_the_filesystem_line(inproc, monkeypatch, tmp_path, capsys):
+    inproc([])
+    LoginNode(monkeypatch, out="S\tserver:/work\t17592186044416\t6319245000000\t10400000000000\t/projects\n" + QUICK)
+    cli.main(["disk", "--scan"])
+    out = capsys.readouterr().out
+    assert "/projects" in out and "% full" in out and "of it" in out
+    assert json.loads((tmp_path / "state/disk/user.json").read_text())["fs"]["mount"] == "/projects"
+
+
+# ---- a quota inside a bigger filesystem: the lab's allocation, and the pool under it ----
+
+PARENT = {"total": 3500 * 1024 * G, "used": 3400 * 1024 * G, "avail": 100 * 1024 * G}
+
+
+def test_a_folder_quota_is_told_apart_from_the_filesystem_under_it(monkeypatch, tmp_path):
+    q = quick("S\tserver:/w\t17042430230528\t13822364483584\t3220065746944\t/projects\nM\t3848290697216000\t3737000000000000\t146000000000000\n" + QUICK)
+    assert q["fs"]["parent"] == {"total": 3848290697216000, "used": 3737000000000000, "avail": 146000000000000}
+    same = quick("S\tserver:/w\t1000\t400\t600\t/projects\nM\t1000\t400\t600\n" + QUICK)
+    assert "parent" not in same["fs"]                                                           # one filesystem, no quota in between
+    assert "fs" not in quick("M\t1000\t400\t600\n" + QUICK)                                     # a mount line alone says nothing
+    assert "df -P -B1" in diskquick.quick_script("/r") and "M\\t" in diskquick.quick_script("/r")
+
+    import collections
+    SV = collections.namedtuple("SV", "f_blocks f_frsize f_bfree f_bavail")
+    root = str(make(tmp_path / "r", TREE))
+    monkeypatch.setattr(diskscan.os, "statvfs", lambda p: SV(100, 1024, 40, 40) if p == root else SV(1000, 1024, 30, 30))
+    monkeypatch.setattr(diskscan.os.path, "ismount", lambda p: p == os.path.dirname(root))
+    fs = diskscan.scan(root, depth=1)["fs"]
+    assert fs["total"] == 100 * 1024 and fs["parent"] == {"total": 1000 * 1024, "used": 970 * 1024, "avail": 30 * 1024}
+
+
+def test_the_header_labels_a_quota_and_shows_the_pool_under_it():
+    scan = {**SCAN, "fs": {**FS, "parent": PARENT}}
+    lines = lines_of(diskview.Explorer(scan, now=NOW))
+    assert lines[2].strip().startswith("/projects quota") and "% full" in lines[2]
+    assert "of it" in lines[3]
+    pool = 100 * PARENT["used"] / PARENT["total"]
+    assert f"{pool:.0f}% full" in lines[4] and "filesystem" in lines[4] and "3.32 P of 3.42 P" in lines[4]
+    assert lines[5].strip() == "me"
+    plain = lines_of(diskview.Explorer({**SCAN, "fs": FS}, now=NOW))
+    assert "quota" not in plain[2] and plain[4].strip() == "me"                                  # no parent: as before
+    coloured = diskview.Explorer(scan, now=NOW).frame(width=100, color=True).splitlines()[4]
+    assert "\x1b[38;5;211m" in coloured                                                          # 97% full is rose
+    for width in (50, 72, 100):
+        assert all(len(shown(l)) <= width for l in diskview.Explorer(scan, now=NOW).frame(width=width, color=True).splitlines())
+    assert all(ord(c) < 128 for c in diskview.Explorer(scan, now=NOW).frame(width=80, uni=False))

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.1 (2026-10-23)
+
+- **`nuhpc disk` shows how full the disk is.** The header gets the filesystem's size, use and free space with a gauge, and this folder's share of it. Where `df` reports a directory quota (as it does inside a group's folder on Explorer), the gauge is labelled `quota` and a second line shows how full the whole filesystem beneath it is. Both scanners record it (`fs` in the JSON, with `parent` for the pool under a quota): the quick scan from `df`, the full scan from `statvfs`.
+
 ## 0.6.0 (2026-10-23)
 
 - **`nuhpc disk`: see where your space goes.** `nuhpc disk --scan` measures a folder tree and opens an interactive explorer in the terminal in the style of `mo analyze`: bars sorted by size with percentages, sizes in the `du -h` convention, ages, arrow keys to drill down and back, `s` to sort by size or age, `l` for the largest files. Pastel colours cycle by rank and ages fade from mint to rose; `NO_COLOR` and a non-UTF-8 locale are honoured, and rows are cut to the terminal width. Piped, `--print` or `--json` gives a static report or the data; the result is cached under `~/.local/share/nuhpc/disk/`, and `--from FILE` opens a saved scan.
