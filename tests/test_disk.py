@@ -373,25 +373,28 @@ def scan_file(tmp_path, root="/projects/me", name="scan.json"):
 
 def args_for(**kw):
     import argparse
-    return argparse.Namespace(**{"project": None, "lab": False, "depth": None, **kw})
+    return argparse.Namespace(**{"project": None, "lab": False, "mine": False, "depth": None, **kw})
 
 
-def test_a_scope_is_your_folder_a_declared_project_or_the_lab_and_nothing_else(tmp_path):
+def test_a_scope_is_the_whole_lab_by_default_your_folder_or_a_declared_project_and_nothing_else(tmp_path):
     cfg = cfg_of(tmp_path)
-    me = cli.disk_scope(cfg, args_for())
+    lab = cli.disk_scope(cfg, args_for())
+    assert (lab["root"], lab["depth"], lab["names"], lab["time"]) == ("/projects/lab", 4, False, "02:00:00")      # all the folders, no file names
+    assert cli.disk_scope(cfg, args_for(lab=True)) == lab and cli.disk_scope(cfg, args_for(depth=6))["depth"] == 6
+    me = cli.disk_scope(cfg, args_for(mine=True))
     assert (me["root"], me["depth"], me["names"], me["time"]) == ("/projects/lab/me", 4, True, "00:30:00")
-    assert cli.disk_scope(cfg, args_for(depth=6))["depth"] == 6
     alpha = cli.disk_scope(cfg, args_for(project="alpha"))
     assert alpha["root"] == "/projects/lab/me/alpha" and alpha["project"] == "alpha" and alpha["names"] is True
-    lab = cli.disk_scope(cfg, args_for(lab=True))
-    assert (lab["root"], lab["depth"], lab["names"], lab["time"]) == ("/projects/lab", 1, False, "02:00:00")   # members' totals only, no file names
-    assert cli.disk_scope(cfg, args_for(lab=True, depth=5))["depth"] == 1                                      # --depth can't open other people's folders
     with pytest.raises(cli.NuhpcError, match="declared"):
         cli.disk_scope(cfg, args_for(project="nope"))
     with pytest.raises(cli.NuhpcError, match="either"):
         cli.disk_scope(cfg, args_for(project="alpha", lab=True))
+    with pytest.raises(cli.NuhpcError, match="either"):
+        cli.disk_scope(cfg, args_for(mine=True, lab=True))
+    top = {"user_dir": "/projects/me"}                                                    # no group folder above: the parent would be /projects
+    assert cli.disk_scope(top, args_for())["root"] == "/projects/me"                      # so the default falls back to your own folder
     with pytest.raises(cli.NuhpcError, match="group folder"):
-        cli.disk_scope({"user_dir": "/projects/me"}, args_for(lab=True))               # the parent would be /projects, shared by everyone
+        cli.disk_scope(top, args_for(lab=True))
 
 
 def test_the_cache_key_comes_from_the_folder_that_was_scanned(tmp_path):
@@ -425,12 +428,12 @@ def test_a_saved_scan_prints_as_a_static_report_and_as_json(inproc, tmp_path, ca
 def test_without_a_scan_the_command_says_how_to_make_one(inproc, tmp_path, capsys):
     inproc([])
     with pytest.raises(SystemExit):
-        cli.main(["disk"])
+        cli.main(["disk", "--mine"])
     assert "nuhpc disk --scan" in capsys.readouterr().err
     cache = tmp_path / "state/disk"
     cache.mkdir(parents=True)
     (cache / "user.json").write_text(json.dumps({**SCAN, "root": str(tmp_path / "remote")}))
-    cli.main(["disk"])
+    cli.main(["disk", "--mine"])
     out = capsys.readouterr().out
     assert "nuhpc disk" in out and "scanned" in out and "models/" in out
 
@@ -470,7 +473,7 @@ def test_a_job_scan_submits_the_job_waits_caches_the_result_and_shows_it(inproc,
     inproc([])
     root = str(tmp_path / "remote")
     cluster = Cluster(monkeypatch, scan_file(tmp_path, root=root))
-    cli.main(["disk", "--scan", "--job"])
+    cli.main(["disk", "--scan", "--job", "--mine"])
     out = capsys.readouterr().out
     assert "nuhpc disk" in out and "models/" in out                                            # (a long root is cut to the width)
     stage, rows = staged(tmp_path)
@@ -484,12 +487,12 @@ def test_a_job_scan_submits_the_job_waits_caches_the_result_and_shows_it(inproc,
     assert [e["template"] for e in cli.ledger_read()][-1] == "disk_scan"
 
 
-def test_a_lab_job_scan_walks_the_group_folder_to_one_level_and_records_no_file_names(inproc, monkeypatch, tmp_path):
+def test_a_lab_job_scan_walks_the_group_folder_to_depth_4_and_records_no_file_names(inproc, monkeypatch, tmp_path):
     inproc([])
     cluster = Cluster(monkeypatch, scan_file(tmp_path, root=str(tmp_path)))
     cli.main(["disk", "--scan", "--lab", "--job"])
     stage, rows = staged(tmp_path)
-    assert rows == [{"root": str(tmp_path), "depth": 1, "names": False, "budget": 7020}]     # 2 h less 3 min
+    assert rows == [{"root": str(tmp_path), "depth": 4, "names": False, "budget": 7020}]     # 2 h less 3 min: every folder to depth 4, no file names
     assert "--time=02:00:00" in (stage / "job.sbatch").read_text()
     assert (tmp_path / "state/disk/lab.json").exists()
     assert cluster.calls
@@ -499,7 +502,7 @@ def test_a_scan_still_waiting_exits_3_and_says_how_to_pick_it_up(inproc, monkeyp
     inproc([])
     Cluster(monkeypatch, scan_file(tmp_path), states=("PENDING",))
     with pytest.raises(SystemExit) as e:
-        cli.main(["--json", "disk", "--scan", "--job", "--timeout", "0"])
+        cli.main(["--json", "disk", "--scan", "--job", "--mine", "--timeout", "0"])
     assert e.value.code == 3
     out = json.loads(capsys.readouterr().out)
     assert out["timed_out"] is True and out["run_id"].startswith("disk-scan-") and f"nuhpc disk --collect {out['run_id']}" in out["next"]
@@ -510,7 +513,7 @@ def test_a_scan_job_that_failed_is_an_error_that_points_at_its_log(inproc, monke
     inproc([])
     Cluster(monkeypatch, scan_file(tmp_path), states=("FAILED",))
     with pytest.raises(SystemExit):
-        cli.main(["disk", "--scan", "--job"])
+        cli.main(["disk", "--scan", "--job", "--mine"])
     assert "nuhpc logs disk-scan-" in capsys.readouterr().err
 
 
@@ -526,7 +529,7 @@ def test_collect_fetches_a_finished_scan_into_the_cache_under_its_own_scope(inpr
 def test_a_dry_run_job_scan_submits_nothing_and_shows_nothing(inproc, monkeypatch, tmp_path, capsys):
     inproc([])
     Cluster(monkeypatch, scan_file(tmp_path))
-    cli.main(["--json", "--dry-run", "disk", "--scan", "--job"])
+    cli.main(["--json", "--dry-run", "disk", "--scan", "--job", "--mine"])
     out = json.loads(capsys.readouterr().out)
     assert out["template"] == "disk_scan" and not (tmp_path / "state/disk").exists()
 
@@ -717,7 +720,7 @@ def test_remote_run_can_feed_a_script_to_the_remote_shell(monkeypatch):
 def test_the_default_scan_runs_du_on_the_login_node_and_submits_no_job(inproc, monkeypatch, tmp_path, capsys):
     inproc([])
     node = LoginNode(monkeypatch)
-    cli.main(["disk", "--scan"])
+    cli.main(["disk", "--scan", "--mine"])
     out = capsys.readouterr()
     assert "nuhpc disk" in out.out and "quick scan" in out.out and "a/" in out.out
     (cmd, retry), = node.calls
@@ -732,19 +735,19 @@ def test_the_default_scan_runs_du_on_the_login_node_and_submits_no_job(inproc, m
     assert "2 folders were not fully read" in out.err
 
 
-def test_the_cap_can_be_raised_and_a_lab_scan_reads_one_level(inproc, monkeypatch, tmp_path):
+def test_the_cap_can_be_raised_and_a_lab_scan_lists_every_folder(inproc, monkeypatch, tmp_path):
     inproc([])
     node = LoginNode(monkeypatch)
     cli.main(["disk", "--scan", "--lab", "--budget", "25"])
     script = node.stdin[0]
-    assert f"cd {tmp_path} || exit 1" in script and "$(( $(date +%s) + 25 ))" in script and "-d 0" in script
+    assert f"cd {tmp_path} || exit 1" in script and "$(( $(date +%s) + 25 ))" in script and "-d 2" in script
     assert (tmp_path / "state/disk/lab.json").exists()
 
 
 def test_a_complete_quick_scan_says_nothing_about_being_partial(inproc, monkeypatch, tmp_path, capsys):
     inproc([])
     LoginNode(monkeypatch, out=QUICK.replace("D\t./c/slow\n", "").replace("D\t./c/slow2\n", "").replace("400\t1790000400\t./c/slow2/part\n", ""))
-    cli.main(["disk", "--scan"])
+    cli.main(["disk", "--scan", "--mine"])
     assert "partial" not in capsys.readouterr().err
 
 
@@ -752,14 +755,14 @@ def test_an_empty_reply_is_an_error_not_an_empty_picture(inproc, monkeypatch, tm
     inproc([])
     LoginNode(monkeypatch, out="", noise="")
     with pytest.raises(SystemExit):
-        cli.main(["disk", "--scan"])
+        cli.main(["disk", "--scan", "--mine"])
     assert "nothing came back" in capsys.readouterr().err and not (tmp_path / "state/disk").exists()
 
 
 def test_a_quick_dry_run_prints_the_command_and_changes_nothing(inproc, monkeypatch, tmp_path):
     inproc([])
     node = LoginNode(monkeypatch)
-    cli.main(["--dry-run", "disk", "--scan"])
+    cli.main(["--dry-run", "disk", "--scan", "--mine"])
     assert not (tmp_path / "state/disk").exists()
 
 
@@ -827,7 +830,7 @@ def test_the_disk_lines_fit_every_width_and_the_ascii_form():
 def test_the_command_caches_and_shows_the_filesystem_line(inproc, monkeypatch, tmp_path, capsys):
     inproc([])
     LoginNode(monkeypatch, out="S\tserver:/work\t17592186044416\t6319245000000\t10400000000000\t/projects\n" + QUICK)
-    cli.main(["disk", "--scan"])
+    cli.main(["disk", "--scan", "--mine"])
     out = capsys.readouterr().out
     assert "/projects" in out and "% full" in out and "of it" in out
     assert json.loads((tmp_path / "state/disk/user.json").read_text())["fs"]["mount"] == "/projects"
@@ -839,12 +842,15 @@ PARENT = {"total": 3500 * 1024 * G, "used": 3400 * 1024 * G, "avail": 100 * 1024
 
 
 def test_a_folder_quota_is_told_apart_from_the_filesystem_under_it(monkeypatch, tmp_path):
-    q = quick("S\tserver:/w\t17042430230528\t13822364483584\t3220065746944\t/projects\nM\t3848290697216000\t3737000000000000\t146000000000000\n" + QUICK)
+    q = quick("S\tserver:/w\t17042430230528\t13822364483584\t3220065746944\t/projects\nM\t3848290697216000\t3737000000000000\t146000000000000\nQ\t/projects/lab\n" + QUICK)
     assert q["fs"]["parent"] == {"total": 3848290697216000, "used": 3737000000000000, "avail": 146000000000000}
+    assert q["fs"]["quota_dir"] == "/projects/lab"                                              # the folder that carries the quota
+    same_q = quick("S\tserver:/w\t1000\t400\t600\t/projects\nM\t1000\t400\t600\nQ\t/projects\n" + QUICK)
+    assert "quota_dir" not in same_q["fs"]                                                      # no quota in between: nothing to name
     same = quick("S\tserver:/w\t1000\t400\t600\t/projects\nM\t1000\t400\t600\n" + QUICK)
     assert "parent" not in same["fs"]                                                           # one filesystem, no quota in between
     assert "fs" not in quick("M\t1000\t400\t600\n" + QUICK)                                     # a mount line alone says nothing
-    assert "df -P -B1" in diskquick.quick_script("/r") and "M\\t" in diskquick.quick_script("/r")
+    assert "df -P -B1" in diskquick.quick_script("/r") and "M\\t" in diskquick.quick_script("/r") and "Q\\t" in diskquick.quick_script("/r")
 
     import collections
     SV = collections.namedtuple("SV", "f_blocks f_frsize f_bfree f_bavail")
@@ -853,20 +859,22 @@ def test_a_folder_quota_is_told_apart_from_the_filesystem_under_it(monkeypatch, 
     monkeypatch.setattr(diskscan.os.path, "ismount", lambda p: p == os.path.dirname(root))
     fs = diskscan.scan(root, depth=1)["fs"]
     assert fs["total"] == 100 * 1024 and fs["parent"] == {"total": 1000 * 1024, "used": 970 * 1024, "avail": 30 * 1024}
+    assert fs["quota_dir"] == root                                                              # the parents above show the bigger pool
+    monkeypatch.setattr(diskscan.os, "statvfs", lambda p: SV(100, 1024, 40, 40) if p in (root, os.path.dirname(root)) else SV(1000, 1024, 30, 30))
+    monkeypatch.setattr(diskscan.os.path, "ismount", lambda p: p == os.path.dirname(os.path.dirname(root)))      # the mount is above the quota folder
+    assert diskscan.scan(root, depth=1)["fs"]["quota_dir"] == os.path.dirname(root)             # the quota sits one folder higher
 
 
-def test_the_header_labels_a_quota_and_shows_the_pool_under_it():
-    scan = {**SCAN, "fs": {**FS, "parent": PARENT}}
+def test_the_header_names_the_lab_quota_and_leaves_out_the_pool_under_it():
+    scan = {**SCAN, "fs": {**FS, "parent": PARENT, "quota_dir": "/projects/lab"}}
     lines = lines_of(diskview.Explorer(scan, now=NOW))
-    assert lines[2].strip().startswith("/projects quota") and "% full" in lines[2]
-    assert "of it" in lines[3]
-    pool = 100 * PARENT["used"] / PARENT["total"]
-    assert f"{pool:.0f}% full" in lines[4] and "filesystem" in lines[4] and "3.32 P of 3.42 P" in lines[4]
-    assert lines[5].strip() == "me"
+    assert lines[2].strip().startswith("lab quota") and "% full" in lines[2] and "/projects" not in lines[2]
+    assert "of it" in lines[3] and lines[4].strip() == "me"                                      # no line about the filesystem under it
+    assert "filesystem under it" not in "\n".join(lines)
+    unnamed = lines_of(diskview.Explorer({**SCAN, "fs": {**FS, "parent": PARENT}}, now=NOW))
+    assert unnamed[2].strip().startswith("/projects quota")                                     # no folder known: the mount names it
     plain = lines_of(diskview.Explorer({**SCAN, "fs": FS}, now=NOW))
-    assert "quota" not in plain[2] and plain[4].strip() == "me"                                  # no parent: as before
-    coloured = diskview.Explorer(scan, now=NOW).frame(width=100, color=True).splitlines()[4]
-    assert "\x1b[38;5;211m" in coloured                                                          # 97% full is rose
+    assert "quota" not in plain[2] and plain[4].strip() == "me"                                  # no parent: not a quota, as before
     for width in (50, 72, 100):
         assert all(len(shown(l)) <= width for l in diskview.Explorer(scan, now=NOW).frame(width=width, color=True).splitlines())
     assert all(ord(c) < 128 for c in diskview.Explorer(scan, now=NOW).frame(width=80, uni=False))
@@ -1085,7 +1093,7 @@ def test_in_a_terminal_the_cached_scan_opens_at_once_and_a_refresh_collects_new_
     (cache / "user.json").write_text(json.dumps({**SCAN, "root": root}))
     node = StreamNode(monkeypatch)
     opened = in_a_terminal(monkeypatch)
-    cli.main(["disk"])
+    cli.main(["disk", "--mine"])
     assert opened["scan_at_open"]["tree"]["bytes"] == ETREE["bytes"] and opened["ex"].can_refresh is True      # the cached data is what opens
     assert node.calls == []                                                                                      # nothing collected before the screen is up
     ref = opened["refresher"]
@@ -1101,7 +1109,7 @@ def test_with_no_cache_the_explorer_opens_on_a_placeholder_and_the_first_scan_fi
     inproc([])
     StreamNode(monkeypatch)
     opened = in_a_terminal(monkeypatch)
-    cli.main(["disk"])
+    cli.main(["disk", "--mine"])
     assert opened["scan_at_open"].get("placeholder") is True and opened["scan_at_open"]["root"] == str(tmp_path / "remote")
     ref = opened["refresher"]
     ref.start()
@@ -1117,7 +1125,7 @@ def test_no_refresh_opens_the_cache_without_touching_the_cluster(inproc, monkeyp
     (cache / "user.json").write_text(json.dumps({**SCAN, "root": str(tmp_path / "remote")}))
     node = StreamNode(monkeypatch)
     opened = in_a_terminal(monkeypatch)
-    cli.main(["disk", "--no-refresh"])
+    cli.main(["disk", "--no-refresh", "--mine"])
     assert opened["refresher"] is None and opened["ex"].can_refresh is False and node.calls == []
 
 
@@ -1140,7 +1148,7 @@ def test_a_job_refresh_reports_queued_running_and_fetching_then_updates_the_cach
     texts = []
     real = diskview.Refresher._progress
     monkeypatch.setattr(diskview.Refresher, "_progress", lambda self, t: (texts.append(t), real(self, t))[1])
-    cli.main(["disk", "--job"])
+    cli.main(["disk", "--job", "--mine"])
     ref = opened["refresher"]
     ref.start()
     ref.join(10)
@@ -1168,3 +1176,79 @@ def test_the_streaming_transport_hands_over_lines_as_they_come_and_the_process_f
     monkeypatch.setattr(cli.subprocess, "Popen", bad)
     with pytest.raises(cli.NuhpcError, match="Permission denied"):
         cli.Remote({"ssh_host": "h"}, False).stream("bash -s", input="x")
+
+
+# ---- a refresh that only partly finishes keeps what an earlier scan knew ----
+
+def qnode(name, size, dirs=(), own=0, **flags):
+    n = {"name": name, "bytes": size, "files": None, "newest": NOW - 1000, "own": {"files": None, "bytes": own}, **flags}
+    if dirs:
+        n["dirs"] = list(dirs)
+    return n
+
+
+OLD_FULL = {"version": 1, "mode": "job", "root": "/projects/lab", "depth": 4, "names": False, "scanned_at": NOW - 3600, "partial": False,
+            "unscanned": 0, "unreadable": 0, "largest": [],
+            "tree": qnode("lab", 810, own=10, dirs=[qnode("shared", 700, dirs=[qnode("raw", 600), qnode("derived", 100)]), qnode("alice", 100)])}
+NEW_PARTIAL = {"version": 1, "mode": "quick", "root": "/projects/lab", "depth": 4, "names": False, "scanned_at": NOW, "partial": True,
+               "unscanned": 2, "unreadable": 0, "largest": [], "fs": {"mount": "/projects", "total": 10, "used": 5, "avail": 5},
+               "tree": qnode("lab", 163, own=10, incomplete=True, dirs=[
+                   qnode("shared", 43, incomplete=True, dirs=[qnode("raw", 0, incomplete=True, unscanned=True), qnode("derived", 43)]),
+                   qnode("alice", 110)])}
+
+
+def test_an_unfinished_folder_is_replaced_by_the_earlier_complete_one_and_the_totals_follow():
+    import copy
+    old, new = copy.deepcopy(OLD_FULL), copy.deepcopy(NEW_PARTIAL)
+    m = diskquick.merge_scans(new, old)
+    assert old == OLD_FULL and new == NEW_PARTIAL                                              # neither input is changed
+    t = m["tree"]
+    shared = sub(t, "shared")
+    assert shared["bytes"] == 700 and shared["carried"] == OLD_FULL["scanned_at"] and "incomplete" not in shared
+    assert [d["name"] for d in shared["dirs"]] == ["raw", "derived"] and sub(shared, "raw")["bytes"] == 600
+    assert sub(t, "alice")["bytes"] == 110 and "carried" not in sub(t, "alice")                      # what the new scan finished stays new
+    assert t["bytes"] == 10 + 700 + 110 and "incomplete" not in t and m["partial"] is False and m["unscanned"] == 0
+    assert m["carried"] == {"from": OLD_FULL["scanned_at"], "folders": 1} and m["mode"] == "quick" and m["scanned_at"] == NOW and m["fs"] == NEW_PARTIAL["fs"]
+
+
+def test_nothing_is_carried_over_when_the_earlier_scan_does_not_know_better():
+    import copy
+    no_shared = copy.deepcopy(OLD_FULL)
+    no_shared["tree"]["dirs"] = [d for d in no_shared["tree"]["dirs"] if d["name"] != "shared"]
+    m = diskquick.merge_scans(copy.deepcopy(NEW_PARTIAL), no_shared)
+    assert m["tree"]["bytes"] == 163 and m["partial"] is True and "carried" not in m                # shared was not in it
+    also_partial = copy.deepcopy(OLD_FULL)
+    also_partial["tree"]["dirs"][0]["incomplete"] = True
+    also_partial["tree"]["dirs"][0]["dirs"][0]["incomplete"] = True                                  # the folder and the part the new scan lacks, both unfinished
+    assert diskquick.merge_scans(copy.deepcopy(NEW_PARTIAL), also_partial)["tree"]["bytes"] == 163  # so an unfinished old folder is no help
+    other_root = {**copy.deepcopy(OLD_FULL), "root": "/projects/elsewhere"}
+    assert diskquick.merge_scans(copy.deepcopy(NEW_PARTIAL), other_root)["tree"]["bytes"] == 163    # a scan of another folder is not used
+    assert diskquick.merge_scans(copy.deepcopy(NEW_PARTIAL), None)["tree"]["bytes"] == 163
+
+
+def test_the_explorer_marks_carried_numbers_and_says_where_they_come_from():
+    import copy
+    m = diskquick.merge_scans(copy.deepcopy(NEW_PARTIAL), copy.deepcopy(OLD_FULL))
+    ex = diskview.Explorer(m, now=NOW)
+    ls = lines_of(ex)
+    assert "carried over" in ls[1] and "1 folder" in ls[1] and "1 h ago" in ls[1]
+    shared = next(l for l in ls if "shared/" in l)
+    assert "↺" in shared and "700 B" in shared and "↺" not in next(l for l in ls if "alice/" in l)
+    ex.key("enter")
+    assert any("from the earlier scan" in l for l in lines_of(ex))                                # inside a carried folder, the page says so
+    assert "~ 700 B" in next(l for l in diskview.Explorer(m, now=NOW).frame(width=80, uni=False).splitlines() if "shared/" in l)
+
+
+def test_a_quick_refresh_merges_with_the_cached_scan_before_it_is_cached(inproc, monkeypatch, tmp_path):
+    inproc([])
+    root = str(tmp_path)                                                                          # the lab folder in these tests
+    cache = tmp_path / "state/disk"
+    cache.mkdir(parents=True)
+    old = {**OLD_FULL, "root": root, "scanned_at": 1_000_000,
+           "tree": qnode("lab", 9500, own=100, dirs=[qnode("a", 3300, dirs=[qnode("b", 2300)]), qnode("c", 9000, dirs=[qnode("slow", 8000), qnode("slow2", 900), qnode("d", 100)])])}
+    (cache / "lab.json").write_text(json.dumps(old))
+    LoginNode(monkeypatch)                                                                        # QUICK: c/slow never finished, c/slow2 was cut off
+    cli.main(["disk", "--scan"])
+    cached = json.loads((cache / "lab.json").read_text())
+    c = sub(cached["tree"], "c")
+    assert c["bytes"] == 9000 and c["carried"] == 1_000_000 and cached["partial"] is False and cached["carried"]["folders"] == 1

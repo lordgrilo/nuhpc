@@ -65,6 +65,13 @@ def _filesystem(root: str) -> dict:
     if top.f_blocks * top.f_frsize != fs["total"]:      # the root sits under a quota: the mount is the bigger pool beneath it
         fs["parent"] = {"total": top.f_blocks * top.f_frsize, "used": (top.f_blocks - top.f_bfree) * top.f_frsize,
                         "avail": top.f_bavail * top.f_frsize}
+        quota_dir = root                                    # the highest folder that still shows the same size is the one with the quota
+        while os.path.dirname(quota_dir) != quota_dir:
+            up = os.statvfs(os.path.dirname(quota_dir))
+            if up.f_blocks * up.f_frsize != fs["total"]:
+                break
+            quota_dir = os.path.dirname(quota_dir)
+        fs["quota_dir"] = quota_dir
     return fs
 
 

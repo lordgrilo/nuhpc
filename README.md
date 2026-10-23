@@ -276,10 +276,11 @@ Explorer standing · cluster time 2026-10-16 10:00
 
 ### Where your space goes: `nuhpc disk`
 
-An explorer for the space your folders use, in the spirit of `mo analyze`: one bar per folder, sorted by size, with its share of the folder above it, its size and how long ago it last changed. Pastel colours cycle down the list and fade from mint (changed recently) to rose (untouched for over a year).
+An explorer for the space your lab's folders use (every member's and the shared ones), in the spirit of `mo analyze`: one bar per folder, sorted by size, with its share of the folder above it, its size and how long ago it last changed. Pastel colours cycle down the list and fade from mint (changed recently) to rose (untouched for over a year).
 
 ```bash
-nuhpc disk                 # opens at once on the last scan, and refreshes in the background (about a minute, no job)
+nuhpc disk                 # the whole lab: opens at once on the last scan, and refreshes in the background (about a minute, no job)
+nuhpc disk --mine          # just your own folder
 nuhpc disk --no-refresh    # just the last scan; nothing is collected
 nuhpc disk hf_cache/hub    # start inside a folder
 nuhpc disk --job           # refresh with the full scan, as a short compute-node job: adds file counts and the largest files
@@ -287,30 +288,29 @@ nuhpc disk --scan --print  # for scripts and pipes: measure first, print the rep
 ```
 
 ```
- nuhpc disk · /projects/lab/you
- scanned 2 min ago · ≥ 682 G · quick scan · partial (1 folder not fully read)
- /projects quota  ███████▋░░░░░░░░░░░░ 38% full · 9.9 T free of 16 T
-  this folder is ≥ 4.2% of it, and ≥ 11% of what is used
-  the filesystem under it is 94% full: 3.3 P of 3.5 P
- you
+ nuhpc disk · /projects/lab
+ scanned 2 min ago · ≥ 5.1 T · quick scan · partial (1 folder not fully read)
+ lab quota  ███████████████▊░░░░ 79% full · 3.4 T free of 16 T
+  this folder is ≥ 31.9% of it, and ≥ 40% of what is used
+ lab
 
-❯  1  ████████████▎░   87.9%  models/                                           600 G   11 d
-   2  █▋░░░░░░░░░░░░   11.7%  runs/                                              80 G  today
-   3  ▏░░░░░░░░░░░░░    0.3%  envs/                                             ≥ 2 G    2 d
-   4  ▏░░░░░░░░░░░░░    0.1%  notes/                                            400 M    2 y
-   5  ▏░░░░░░░░░░░░░    0.0%  (files in this folder)                              4 K
+❯  1  ██████▋░░░░░░░   47.1%  archive/                                          2.4 T   3 mo
+   2  ███░░░░░░░░░░░   21.6%  alice/                                            1.1 T  today
+   3  ██▌░░░░░░░░░░░   17.6%  datasets/                                       ≥ 922 G    1 d
+   4  █▉░░░░░░░░░░░░   13.7%  bob/                                              717 G    8 d
 
- ↑↓ move · ⏎ open · ⌫ back · s sort: size · l largest · q quit                           1/5
+ ↑↓ move · ⏎ open · ⌫ back · s sort: size · l largest · q quit                           1/4
 ```
 
 Keys: `r` collects again, up and down (or `j` and `k`) move, Enter or right opens a folder, Backspace or left goes back to where you were, `s` sorts by size or by age (the stalest first, for clearing out), `l` lists the largest files (full scans only; Enter shows the folder one lives in), `q` quits. Piped, or with `--print`, it prints the report once; `--json` prints the scan.
 
-- **How full the disk is.** Below the title, the explorer shows the filesystem the folder lives on: a bar with how full it is, what is free, and how much of it this folder takes. On a cluster with directory quotas, `df` inside a group's folder reports the group's quota (on Explorer, each group's top folder has its own: 16 T for one lab, 35 T for another), so that is what the bar shows, labelled `quota`; a further line then says how full the whole filesystem under it is. Both come from `df`, which costs nothing.
+- **How full the disk is.** Below the title, the explorer shows the space your group may use: a bar with how full it is, what is free, and how much of it the folder on screen takes. On a cluster with directory quotas, `df` inside a group's folder reports the group's quota (on Explorer each group's top folder has its own: 16 T for one lab, 35 T for another), so that is what the bar shows, labelled with the name of the folder that carries it (`lab quota`). It comes from `df`, which costs nothing. The size of the whole filesystem beneath the quota is kept in the JSON (`fs.parent`) but not shown, since it is not yours to use.
 - **Live refresh.** In a terminal the explorer opens at once on the last scan (an empty one, the first time) and a line under the title says what is being collected, with a spinner and the time: "connecting…", then "collecting folder sizes · 307 measured · 5 s", or for `--job` "queued as job N…", "running on a compute node…", "fetching the result…". When the new data arrives it is swapped in place, keeping the folder you are in and the row you are on, and the line turns into "updated just now". If the refresh fails the old data stays, with the reason. Quitting stops what was started. `--no-refresh` skips the collection; piped, with `--print` or `--json`, nothing is refreshed unless you say `--scan` or `--job`.
+- **A refresh never makes the picture worse.** A quick refresh that cannot finish a folder inside its time cap keeps the numbers an earlier scan had for that folder: the row is marked `↺`, the header says how many folders were carried over and from when, and inside such a folder a note says the numbers are from the earlier scan. Folders no earlier scan knew show as lower bounds (`≥`) as before.
 - **The quick scan is not a job.** `--scan` runs `du` on the login node: a small script goes over ssh on stdin and runs six `du` at a time, one per folder two levels down, each at the lowest priority and all inside a time cap (`--budget`, 60 s by default). Nothing is written on the cluster. Folders `du` does not finish inside the cap show as `not read`, and the folders above them as lower bounds (`≥ 7.84 G`, as in the sample, where `envs` was cut off), with a note saying so; raise the cap, or use `--job`. It gives sizes and ages, not file counts or file names.
 - **Why `du`, and why capped.** On project storage a single reader gets through about 800 files a second, so a folder of hundreds of thousands of small files (a Python environment) takes minutes. Login nodes allow each user a fraction of one core and kill processes that use more: a multi-threaded scanner written in Python was killed about half the time there, while `du`, which mostly waits on the file server, was not. Hence several `du` in parallel and a hard cap, rather than one clever walker.
 - **The full scan: `--job`.** The `disk_scan` template runs a read-only walk with 16 parallel readers on a compute node (4 CPUs, 30 minutes at most, so under 2 CPU-hours, and it appears in `nuhpc usage`); it queues like any job. It adds file counts, the 8 largest files of each folder and the 25 largest overall, counts unreadable folders, and reports a partial result if it runs out of time. If `--job --print` times out while still queued it exits with status 3 and the run id; `nuhpc wait RUN` and then `nuhpc disk --collect RUN` bring the result in.
-- **Scopes.** By default your `user_dir`; `--project NAME` for a declared project's folder; `--lab` for your group's folder (the parent of `user_dir`), which keeps one total per member and no file names at all (a `--job` lab scan gets 2 hours). `--depth` sets how many folder levels are listed (default 4; deeper folders are only totalled). The result is cached per scope in `~/.local/share/nuhpc/disk/` and its age is on screen; `nuhpc disk --from scan.json` opens a saved scan, for example one a colleague sent you.
+- **Scopes.** By default the whole lab: your group's folder (the parent of `user_dir`), every member's folders and the shared ones, with folder names listed to `--depth` (default 4) and no file names for anyone (a `--job` scan of your own folder records them). `--mine` is only your own `user_dir`, `--project NAME` a declared project's folder, and without a group folder above `user_dir` the default is your own folder. A `--job` lab scan gets 2 hours. The result is cached per scope in `~/.local/share/nuhpc/disk/` and its age is on screen; `nuhpc disk --from scan.json` opens a saved scan, for example one a colleague sent you.
 - **Sizes** are apparent sizes, what `ls -l` reports, in powers of 1024 with the letters `du -h` and `df -h` use (`631 G`), not blocks allocated on disk. Symlinks are never followed, `.snapshot` folders are skipped, and with `--job` folders you cannot read are counted and flagged.
 - **Read-only.** The explorer cannot delete anything, and neither can nuhpc: clean up in a shell, after reading the list (see "Cleaning up").
 

@@ -9,6 +9,7 @@ Colours are 256-colour pastels, cycled by rank; ages fade from mint (fresh) to r
 from __future__ import annotations
 
 import os
+import posixpath
 import select
 import shutil
 import sys
@@ -215,6 +216,14 @@ class Explorer:
     def now(self) -> float:
         return time.time() if self._now is None else self._now
 
+    def _carried_at(self):
+        """When the numbers of the current folder were measured, if they were carried over from an earlier scan, else None."""
+        node, at = self.scan["tree"], self.scan["tree"].get("carried")
+        for name in self.path:
+            node = next((d for d in node.get("dirs", []) if d["name"] == name), node)
+            at = node.get("carried") or at
+        return at
+
     def set_status(self, text, kind: str = "busy") -> None:
         self.status = (text, kind) if text else None
 
@@ -250,7 +259,8 @@ class Explorer:
     def entries(self) -> list:
         n, total = self.node(), self.node()["bytes"]
         out = [{"kind": "dir", "name": d["name"] + "/", "key": d["name"], "bytes": d["bytes"], "files": d["files"], "mtime": d["newest"],
-                "unscanned": bool(d.get("unscanned")), "incomplete": bool(d.get("incomplete"))} for d in n.get("dirs", [])]
+                "unscanned": bool(d.get("unscanned")), "incomplete": bool(d.get("incomplete")), "carried": bool(d.get("carried"))}
+               for d in n.get("dirs", [])]
         tops = n.get("top", [])
         out += [{"kind": "file", "name": f["name"], "key": f["name"], "bytes": f["bytes"], "files": None, "mtime": f["mtime"]} for f in tops]
         own = n.get("own", {"files": 0, "bytes": 0})
@@ -380,6 +390,8 @@ class Explorer:
         head = [P.row(" ", ("nuhpc disk", "pink", "bold"), f" {sep} ", (s["root"], "lavender")),
                 P.row(" ", (facts, "dim"),
                       *([(f" {sep} quick scan", "dim")] if s.get("mode") == "quick" else []),
+                      *([(f" {sep} {s['carried']['folders']} folder{'s' if s['carried']['folders'] != 1 else ''} carried over from the scan of "
+                          f"{fmt_ago(self.now - s['carried']['from'])}", "dim")] if s.get("carried") else []),
                       *([(f" {sep} partial ({s.get('unscanned', 0)} folder{'s' if s.get('unscanned', 0) != 1 else ''} not fully read)", "peach")] if s.get("partial") else []),
                       *([(f" {sep} {s['unreadable']} unreadable", "rose")] if s.get("unreadable") else []))]
         if self.status:
@@ -392,16 +404,12 @@ class Explorer:
         if fs and fs.get("total"):                              # how full the whole disk is, and this folder's share of it
             frac = fs["used"] / fs["total"]
             colour = "mint" if frac < 0.70 else "lemon" if frac < 0.85 else "peach" if frac < 0.95 else "rose"
-            head.append(P.row(" ", (fs["mount"] + (" quota" if fs.get("parent") else ""), "lavender"), "  ", (hbar(frac, 20 if width >= 72 else 12, uni), colour), f" {frac * 100:.0f}% full",
+            label = (posixpath.basename(fs["quota_dir"].rstrip("/")) or fs["mount"]) if fs.get("quota_dir") else fs["mount"]
+            head.append(P.row(" ", (label + (" quota" if fs.get("parent") else ""), "lavender"), "  ", (hbar(frac, 20 if width >= 72 else 12, uni), colour), f" {frac * 100:.0f}% full",
                               (f" {sep} {fmt_size(fs['avail'])} free of {fmt_size(fs['total'])}", "dim")))
             lower = ("≥ " if uni else ">= ") if t.get("incomplete") else ""
             used = f", and {lower}{100 * t['bytes'] / fs['used']:.0f}% of what is used" if fs.get("used") else ""
             head.append(P.row("  ", (f"this folder is {lower}{100 * t['bytes'] / fs['total']:.1f}% of it{used}", "dim")))
-            pool = fs.get("parent")
-            if pool and pool.get("total"):                  # the quota sits inside a bigger filesystem: how full is that?
-                pf = pool["used"] / pool["total"]
-                head.append(P.row("  ", ("the filesystem under it is ", "dim"), (f"{pf * 100:.0f}% full", "mint" if pf < 0.70 else "lemon" if pf < 0.85
-                                 else "peach" if pf < 0.95 else "rose"), (f": {fmt_size(pool['used'])} of {fmt_size(pool['total'])}", "dim")))
         if self.view == "largest":
             head.append(P.row(" ", ("largest files", "bold"), (f" {sep} biggest {len(s.get('largest', []))} in the scan", "dim")))
         else:
@@ -430,6 +438,8 @@ class Explorer:
             note = f"this scan listed folders to depth {s['depth']}; below here only totals are kept (rescan deeper with --depth N)"
         elif not note and self.view == "tree" and n.get("unscanned"):
             note = "this folder was not read: the scan ran out of time before reaching it"
+        elif not note and self.view == "tree" and self._carried_at():
+            note = f"these numbers are from the earlier scan ({fmt_ago(self.now - self._carried_at())}): the refresh did not finish this folder"
         lines = head + body + [P.row(" ", (note, "peach")) if note else ""]
         if footer:
             if self.view == "tree":
@@ -466,6 +476,7 @@ class Explorer:
                      (name, "bold") if sel and e["kind"] != "other" else (name, "dim") if e["kind"] == "other" else name,
                      " " * (namew - len(name)), "  ", (f"{'not read':>8}", "dim") if unread else
                      ((f"{('≥ ' if uni else '>= ') + fmt_size(e['bytes']):>8}", "peach") if e.get("incomplete")
+                      else (f"{('↺ ' if uni else '~ ') + fmt_size(e['bytes']):>8}", "dim") if e.get("carried")
                       else (f"{fmt_size(e['bytes']):>8}", "bold"))]
             if show_files:
                 parts += ["  ", (f"{e['files']:,} files".rjust(fw) if e["files"] is not None else " " * fw, "dim")]

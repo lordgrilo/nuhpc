@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.0 (2026-10-23)
+
+- **`nuhpc disk` shows the whole lab by default.** It used to show only your own folder; now it opens on your group's folder (the parent of `user_dir`) with every member's folders and the shared ones, listed to depth 4 with folder names but no file names. `--mine` is your own folder as before, `--lab` is the default spelled out, and without a group folder above `user_dir` the default is your own folder.
+- **The quota is the lab's, and named.** The header's gauge is labelled with the folder that carries the quota (`lab quota`, found by climbing from the scanned folder while `df` shows the same size), and the line about the whole filesystem under it is gone (the figures stay in the JSON as `fs.parent`).
+- **A refresh never makes the picture worse.** A partial quick refresh keeps an earlier scan's complete numbers for the folders it could not finish: they are marked `↺`, the header counts them, and a note appears inside them. (Before, every refresh replaced a complete full scan with lower bounds.)
+
 ## 0.7.0 (2026-10-23)
 
 - **`nuhpc disk` opens at once and refreshes live.** In a terminal the explorer shows the last scan immediately (an empty one the first time) while the new data is collected on a thread. A line under the title says what is happening, with a spinner and the time: "connecting…", then "collecting folder sizes · N measured" for the quick scan (the remote output is streamed), or "queued as job N…", "running on a compute node…", "fetching the result…" for `--job`. The new scan is swapped in place, keeping your folder and row, and the line becomes "updated just now" (or the reason it failed, with the old data kept). `r` collects again, `--no-refresh` skips it, quitting stops the collection, and stderr output during the refresh is held back so it cannot tear the screen. Piped, `--print` and `--json` behave as before: nothing is refreshed unless `--scan` or `--job` is given.

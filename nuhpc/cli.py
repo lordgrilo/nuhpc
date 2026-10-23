@@ -1668,21 +1668,24 @@ def cmd_ls(args, cfg, R):
 # --------------------------------------------------------------------------- disk
 
 def disk_scope(cfg: dict, args) -> dict:
-    """Which folder to measure and how: your user_dir, a declared project's folder, or your group's folder (the parent of
-    user_dir), where only one total per member is kept and no file names. Nothing outside these can be scanned."""
-    if getattr(args, "project", None) and getattr(args, "lab", False):
-        raise NuhpcError("use either --project or --lab, not both")
+    """Which folder to measure and how. By default the whole lab: your group's folder (the parent of user_dir), every member's folders and
+    the shared ones, listed to depth 4 with folder names but no file names. `--mine` is just your user_dir, and `--project NAME` a declared
+    project's folder. Nothing outside these can be scanned. Without a group folder above user_dir, the default is your own folder."""
+    flags = [bool(getattr(args, "project", None)), bool(getattr(args, "lab", False)), bool(getattr(args, "mine", False))]
+    if sum(flags) > 1:
+        raise NuhpcError("use either --project, --lab or --mine, not more than one")
     depth = getattr(args, "depth", None) or 4
-    if getattr(args, "lab", False):
-        parent = posixpath.dirname(user_dir(cfg))
-        if parent.count("/") < 2:
-            raise NuhpcError(f"--lab needs user_dir inside a group folder such as /projects/<group>/<you>, not {user_dir(cfg)}")
-        return {"root": parent, "depth": 1, "names": False, "time": "02:00:00", "project": None}
     if getattr(args, "project", None):
         proj = cfg.get("projects", {}).get(args.project)
         if not proj:
             raise NuhpcError(f"no folder is declared for project '{args.project}': add [projects.{args.project}] dir = ... to the config")
         return {"root": proj["dir"].rstrip("/"), "depth": depth, "names": True, "time": "00:30:00", "project": args.project}
+    parent = posixpath.dirname(user_dir(cfg))
+    has_group = parent.count("/") >= 2
+    if getattr(args, "lab", False) and not has_group:
+        raise NuhpcError(f"--lab needs user_dir inside a group folder such as /projects/<group>/<you>, not {user_dir(cfg)}")
+    if has_group and not getattr(args, "mine", False):
+        return {"root": parent, "depth": depth, "names": False, "time": "02:00:00", "project": None}
     return {"root": user_dir(cfg), "depth": depth, "names": True, "time": "00:30:00", "project": None}
 
 
@@ -1719,6 +1722,10 @@ def finish_quick(out: str, scope: dict, cfg: dict, started: float) -> dict:
     scan = diskquick.tree_from_quick(out, scope["root"], scope["depth"], elapsed=time.monotonic() - started, host=cfg["ssh_host"])
     cache = STATE_DIR / "disk"
     cache.mkdir(parents=True, exist_ok=True)
+    try:                                                          # folders this run could not finish keep what the last scan knew
+        scan = diskquick.merge_scans(scan, load_scan(cache / f"{scope_key(cfg, scan['root'])}.json"))
+    except NuhpcError:
+        pass
     tmp = cache / ".incoming.json"
     tmp.write_text(json.dumps(scan, separators=(",", ":")))
     os.replace(tmp, cache / f"{scope_key(cfg, scan['root'])}.json")
@@ -2044,7 +2051,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--collect", metavar="RUN", help="fetch the result of a --job scan that finished after its wait timed out")
     p.add_argument("--from", dest="from_file", metavar="FILE", help="explore a saved scan.json instead")
     p.add_argument("--project", help="scan or show this declared project's folder")
-    p.add_argument("--lab", action="store_true", help="your group's folder: one total per member, no file names")
+    p.add_argument("--lab", action="store_true", help="the whole lab: your group's folder, every member's folders and the shared ones "
+                                                   "(the default; folder names to --depth, no file names)")
+    p.add_argument("--mine", action="store_true", help="only your own folder (user_dir), instead of the whole lab")
     p.add_argument("--depth", type=int, help="levels of folders the scan lists (default 4); deeper ones are only totalled")
     p.add_argument("--print", action="store_true", help="print the report once instead of opening the explorer")
     p.add_argument("--no-refresh", action="store_true", help="in a terminal, open the cached scan without collecting fresh data "

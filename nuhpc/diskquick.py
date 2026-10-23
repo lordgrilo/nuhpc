@@ -10,6 +10,7 @@ finished), and every folder above it is marked `incomplete`, since its total is 
 """
 from __future__ import annotations
 
+import copy
 import posixpath
 import shlex
 import time
@@ -19,12 +20,16 @@ PARALLEL = 6
 
 def quick_script(root: str, depth: int = 4, budget: float = 60, parallel: int = PARALLEL) -> str:
     """The remote script (run with `bash -s`). It prints five kinds of record, one per line: S<TAB>filesystem<TAB>total<TAB>used<TAB>avail
-    <TAB>mount and M<TAB>total<TAB>used<TAB>avail of the whole mount (both from `df`), D<TAB>path (a folder one or two levels down), F<TAB>bytes<TAB>mtime<TAB>folder (a file beside folders, in the root or a
+    <TAB>mount, M<TAB>total<TAB>used<TAB>avail of the whole mount and Q<TAB>folder (the highest folder that shares the first record's size:
+    the one a quota is set on), all from `df`, D<TAB>path (a folder one or two levels down), F<TAB>bytes<TAB>mtime<TAB>folder (a file beside folders, in the root or a
     first-level folder), and du's own `bytes<TAB>mtime<TAB>path` for each second-level folder. All paths are relative to root."""
     d = max(0, depth - 2)
     return f"""cd {shlex.quote(root)} || exit 1
 timeout 10 df -P -B1 . 2>/dev/null | awk 'NR==2 {{print "S\\t"$1"\\t"$2"\\t"$3"\\t"$4"\\t"$6}}'
 timeout 10 df -P -B1 "$(df -P . 2>/dev/null | awk 'NR==2 {{print $6}}')" 2>/dev/null | awk 'NR==2 {{print "M\\t"$2"\\t"$3"\\t"$4}}'
+d=$(pwd); t=$(timeout 10 df -P -B1 . 2>/dev/null | awk 'NR==2 {{print $2}}')
+while [ "$d" != / ]; do p=$(dirname "$d"); [ "$(timeout 10 df -P -B1 "$p" 2>/dev/null | awk 'NR==2 {{print $2}}')" = "$t" ] || break; d=$p; done
+printf 'Q\\t%s\\n' "$d"
 END=$(( $(date +%s) + {int(budget)} )); export END
 find . -mindepth 1 -maxdepth 2 -xdev -type d -printf 'D\\t%p\\n' 2>/dev/null
 find . -maxdepth 1 -xdev ! -type d -printf 'F\\t%s\\t%T@\\t.\\n' 2>/dev/null
@@ -43,7 +48,7 @@ def _rel(path: str) -> str:
 def tree_from_quick(out: str, root: str, depth: int = 4, elapsed: float = 0.0, host: str = "") -> dict:
     """Assemble the scan (the same JSON shape as diskscan's, with `mode: quick`) from the remote script's records.
     Lines that are not records (a login banner, a half line) are ignored."""
-    dirs, sizes, own, fs, pool = set(), {}, {}, None, None
+    dirs, sizes, own, fs, pool, quota_dir = set(), {}, {}, None, None, None
     for line in out.splitlines():
         f = line.split("\t")
         try:
@@ -51,6 +56,8 @@ def tree_from_quick(out: str, root: str, depth: int = 4, elapsed: float = 0.0, h
                 dirs.add(_rel(f[1]))
             elif f[0] == "S" and len(f) == 6:
                 fs = {"name": f[1], "total": int(f[2]), "used": int(f[3]), "avail": int(f[4]), "mount": f[5]}
+            elif f[0] == "Q" and len(f) == 2:
+                quota_dir = f[1]
             elif f[0] == "M" and len(f) == 4:
                 pool = {"total": int(f[1]), "used": int(f[2]), "avail": int(f[3])}
             elif f[0] == "F" and len(f) == 4:
@@ -63,6 +70,8 @@ def tree_from_quick(out: str, root: str, depth: int = 4, elapsed: float = 0.0, h
             continue
     if fs and pool and pool["total"] != fs["total"]:       # df inside the folder shows a quota, not the whole filesystem
         fs["parent"] = pool
+        if quota_dir:
+            fs["quota_dir"] = quota_dir
     known = {p for p in dirs | set(sizes) if p}
     for p in list(known):                                      # every folder above a known one is known
         while "/" in p:
@@ -108,3 +117,52 @@ def tree_from_quick(out: str, root: str, depth: int = 4, elapsed: float = 0.0, h
             "scanned_at": int(now), "scanned": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)),
             "elapsed_s": round(elapsed, 1), "n_dirs": len(known), "partial": bool(tree.get("incomplete")),
             "unscanned": unscanned, "unreadable": 0, "tree": tree, "largest": []}
+
+
+def merge_scans(new: dict, old) -> dict:
+    """A partial quick scan, completed where it can be from an earlier scan of the same folder: a folder the new scan did not finish is
+    replaced by the earlier scan's complete one (marked `carried` with that scan's time) and the totals above it are recomputed.
+    Neither input is changed. An earlier scan of another folder, or one that did not finish that folder either, is no help."""
+    if not old or old.get("root") != new.get("root") or old.get("placeholder") or not old.get("scanned_at"):
+        return new
+    new = copy.deepcopy(new)
+    swapped = [0]
+
+    def older(path):
+        node = old["tree"]
+        for name in path:
+            node = next((d for d in node.get("dirs", []) if d["name"] == name), None)
+            if node is None:
+                return None
+        return node
+
+    def walk(node, path):
+        level = len(path)
+        for i, child in enumerate(node.get("dirs", [])):
+            before = path + [child["name"]]
+            if child.get("incomplete"):
+                prior = older(before)
+                if prior is not None and not prior.get("incomplete") and not prior.get("unscanned"):
+                    node["dirs"][i] = dict(copy.deepcopy(prior), carried=old["scanned_at"])
+                    swapped[0] += 1
+                    continue
+            walk(child, before)
+        if node.get("dirs"):                                   # the totals follow the children: own files plus every folder beneath
+            node["bytes"] = node["own"]["bytes"] + sum(c["bytes"] for c in node["dirs"])
+            node["newest"] = max([n for n in [node.get("newest")] + [c.get("newest") for c in node["dirs"]] if n is not None], default=None)
+            node["dirs"].sort(key=lambda d: (-d["bytes"], d["name"]))
+            if level < 2:                                      # a root or first-level folder is unfinished only if something in it is
+                if any(c.get("incomplete") for c in node["dirs"]):
+                    node["incomplete"] = True
+                else:
+                    node.pop("incomplete", None)
+
+    walk(new["tree"], [])
+
+    def unfinished(node, level):                               # second-level folders (and below) the scan still has not finished
+        return (1 if level >= 2 and node.get("incomplete") else 0) + sum(unfinished(c, level + 1) for c in node.get("dirs", []))
+    new["unscanned"] = unfinished(new["tree"], 0)
+    new["partial"] = bool(new["tree"].get("incomplete"))
+    if swapped[0]:
+        new["carried"] = {"from": old["scanned_at"], "folders": swapped[0]}
+    return new
