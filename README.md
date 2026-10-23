@@ -274,6 +274,40 @@ Explorer standing · cluster time 2026-10-16 10:00
 - **Let it decay, and spread bursts.** A burst keeps the account above its share for weeks; nothing you do afterwards removes it earlier, but not repeating it lets it halve each week. Packing rows and moving jobs to quiet hours do not change the bill (they do avoid waiting).
 - **It is shared.** Everyone in the account has the same factor, so a heavy member sets it for the lab; `nuhpc standing --users` shows who. Whether a larger share or a group allocation is available is a question for Research Computing.
 
+### Where your space goes: `nuhpc disk`
+
+An explorer for the space your folders use, in the spirit of `mo analyze`: one bar per folder, sorted by size, with its share of the folder above it, its size and how long ago it last changed. Pastel colours cycle down the list and fade from mint (changed recently) to rose (untouched for over a year).
+
+```bash
+nuhpc disk --scan          # measure (about a minute, no job), then open the explorer
+nuhpc disk                 # open the cached scan again, instantly
+nuhpc disk hf_cache/hub    # start inside a folder
+nuhpc disk --scan --job    # the full scan as a short compute-node job: adds file counts and the largest files
+```
+
+```
+ nuhpc disk · /projects/lab/you
+ scanned 2 min ago · ≥ 682 G · quick scan · partial (1 folder not fully read)
+ you
+
+❯  1  ████████████▎░   87.9%  models/                                           600 G   11 d
+   2  █▋░░░░░░░░░░░░   11.7%  runs/                                              80 G  today
+   3  ▏░░░░░░░░░░░░░    0.3%  envs/                                             ≥ 2 G    2 d
+   4  ▏░░░░░░░░░░░░░    0.1%  notes/                                            400 M    2 y
+   5  ▏░░░░░░░░░░░░░    0.0%  (files in this folder)                              4 K
+
+ ↑↓ move · ⏎ open · ⌫ back · s sort: size · l largest · q quit                           1/5
+```
+
+Keys: up and down (or `j` and `k`) move, Enter or right opens a folder, Backspace or left goes back to where you were, `s` sorts by size or by age (the stalest first, for clearing out), `l` lists the largest files (full scans only; Enter shows the folder one lives in), `q` quits. Piped, or with `--print`, it prints the report once; `--json` prints the scan.
+
+- **The quick scan is not a job.** `--scan` runs `du` on the login node: a small script goes over ssh on stdin and runs six `du` at a time, one per folder two levels down, each at the lowest priority and all inside a time cap (`--budget`, 60 s by default). Nothing is written on the cluster. Folders `du` does not finish inside the cap show as `not read`, and the folders above them as lower bounds (`≥ 7.84 G`, as in the sample, where `envs` was cut off), with a note saying so; raise the cap, or use `--job`. It gives sizes and ages, not file counts or file names.
+- **Why `du`, and why capped.** On project storage a single reader gets through about 800 files a second, so a folder of hundreds of thousands of small files (a Python environment) takes minutes. Login nodes allow each user a fraction of one core and kill processes that use more: a multi-threaded scanner written in Python was killed about half the time there, while `du`, which mostly waits on the file server, was not. Hence several `du` in parallel and a hard cap, rather than one clever walker.
+- **The full scan: `--job`.** The `disk_scan` template runs a read-only walk with 16 parallel readers on a compute node (4 CPUs, 30 minutes at most, so under 2 CPU-hours, and it appears in `nuhpc usage`); it queues like any job. It adds file counts, the 8 largest files of each folder and the 25 largest overall, counts unreadable folders, and reports a partial result if it runs out of time. If `--job` times out while still queued it exits with status 3 and the run id; `nuhpc wait RUN` and then `nuhpc disk --collect RUN` bring the result in.
+- **Scopes.** By default your `user_dir`; `--project NAME` for a declared project's folder; `--lab` for your group's folder (the parent of `user_dir`), which keeps one total per member and no file names at all (a `--job` lab scan gets 2 hours). `--depth` sets how many folder levels are listed (default 4; deeper folders are only totalled). The result is cached per scope in `~/.local/share/nuhpc/disk/` and its age is on screen; `nuhpc disk --from scan.json` opens a saved scan, for example one a colleague sent you.
+- **Sizes** are apparent sizes, what `ls -l` reports, in powers of 1024 with the letters `du -h` and `df -h` use (`631 G`), not blocks allocated on disk. Symlinks are never followed, `.snapshot` folders are skipped, and with `--job` folders you cannot read are counted and flagged.
+- **Read-only.** The explorer cannot delete anything, and neither can nuhpc: clean up in a shell, after reading the list (see "Cleaning up").
+
 ## Workflows
 
 ### Quick tests: `nuhpc run`
@@ -364,6 +398,7 @@ Model size drives queue time more than anything else: one A100-80GB or H200 job 
 | `nuhpc push LOCAL [REL] [--project P] [--globus]` | upload data to `<work root>/data/REL` |
 | `nuhpc pull REL [LOCAL] [--project P] [--globus]` | download a path relative to the work root |
 | `nuhpc ls [REL] [--project P]` | list a directory under the work root |
+| `nuhpc disk [PATH] [--scan] [--project P \| --lab] [--depth N]` | where your space goes: a quick `du` scan (no job; `--job` for a full one), then an interactive terminal explorer (see Where your space goes) |
 | `nuhpc check [--smoke] [--project P]` / `nuhpc connect` | verify SSH and `user_dir`, create the work root, list partitions / open the persistent SSH session (interactive) |
 | `nuhpc init [--user-dir DIR]` | write the example config, with your `user_dir` filled in |
 
