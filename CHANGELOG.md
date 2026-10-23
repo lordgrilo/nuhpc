@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.0 (2026-10-23)
+
+- **`nuhpc disk` opens at once and refreshes live.** In a terminal the explorer shows the last scan immediately (an empty one the first time) while the new data is collected on a thread. A line under the title says what is happening, with a spinner and the time: "connecting…", then "collecting folder sizes · N measured" for the quick scan (the remote output is streamed), or "queued as job N…", "running on a compute node…", "fetching the result…" for `--job`. The new scan is swapped in place, keeping your folder and row, and the line becomes "updated just now" (or the reason it failed, with the old data kept). `r` collects again, `--no-refresh` skips it, quitting stops the collection, and stderr output during the refresh is held back so it cannot tear the screen. Piped, `--print` and `--json` behave as before: nothing is refreshed unless `--scan` or `--job` is given.
+- **A scan job never runs from inside the folder it scans.** `disk --project NAME --job` used to submit under that project's tag, putting its run folder inside the project directory; it now always runs from your own work root.
+- **`submit` no longer double-queues after an sbatch error.** Slurm sometimes accepts a job and still reports "Unexpected message received"; `nuhpc submit` now looks for a job already queued from that run's folder and adopts it, so a retry does not queue it twice.
+- New `Remote.stream` (lines as they arrive, never retried) and `--no-refresh`.
+
 ## 0.6.1 (2026-10-23)
 
 - **`nuhpc disk` shows how full the disk is.** The header gets the filesystem's size, use and free space with a gauge, and this folder's share of it. Where `df` reports a directory quota (as it does inside a group's folder on Explorer), the gauge is labelled `quota` and a second line shows how full the whole filesystem beneath it is. Both scanners record it (`fs` in the JSON, with `parent` for the pool under a quota): the quick scan from `df`, the full scan from `statvfs`.

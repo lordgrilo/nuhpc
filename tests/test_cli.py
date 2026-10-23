@@ -1313,3 +1313,38 @@ def test_waste_weights_each_task_by_its_hours_and_judges_cores_on_cpu_only_tasks
 def test_waste_is_dashes_when_nothing_can_be_measured():
     assert cli.waste([]) == {"cpu_idle_%": "-", "gpu_idle_%": "-", "failed_%": "-"}
     assert cli.waste([task(state="CANCELLED")]) == {"cpu_idle_%": "-", "gpu_idle_%": "-", "failed_%": "-"}      # nothing billed, nothing lost
+
+
+# ---- sbatch can report an error and still have created the job ----
+
+def flaky_sbatch(monkeypatch, squeue_reply):
+    calls = []
+
+    def fake_run(self, cmd, retry=True, input=None):
+        calls.append(cmd)
+        if "sbatch" in cmd:
+            raise cli.NuhpcError("command failed (1): ssh -o BatchMode=yes ...\nsbatch: error: Batch job submission failed: Unexpected message received")
+        if cmd.startswith("squeue"):
+            return squeue_reply
+        return ""
+    monkeypatch.setattr(cli.Remote, "run", fake_run)
+    monkeypatch.setattr(cli.Remote, "rsync", lambda self, *a, **k: None)
+    return calls
+
+
+def test_a_submission_that_reports_an_error_but_created_the_job_is_adopted_not_repeated(inproc, monkeypatch, capsys):
+    inproc([])
+    calls = flaky_sbatch(monkeypatch, "4242\n")
+    cli.main(["--json", "submit", "cmd", "-p", "cmd=true", "--partition", "short"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["job_id"] == "4242" and sum("sbatch" in c for c in calls) == 1                  # one sbatch: nothing submitted twice
+    assert any(c.startswith("squeue") and out["remote_dir"] in c for c in calls)               # found by the run folder it was submitted from
+    assert cli.ledger_read()[-1]["job_id"] == "4242"
+
+
+def test_a_failed_submission_that_left_no_job_still_fails(inproc, monkeypatch, capsys):
+    inproc([])
+    flaky_sbatch(monkeypatch, "")
+    with pytest.raises(SystemExit):
+        cli.main(["submit", "cmd", "-p", "cmd=true", "--partition", "short"])
+    assert "Unexpected message received" in capsys.readouterr().err and cli.ledger_read()[-1]["run_id"].startswith("r1-")

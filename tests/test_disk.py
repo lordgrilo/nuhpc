@@ -870,3 +870,301 @@ def test_the_header_labels_a_quota_and_shows_the_pool_under_it():
     for width in (50, 72, 100):
         assert all(len(shown(l)) <= width for l in diskview.Explorer(scan, now=NOW).frame(width=width, color=True).splitlines())
     assert all(ord(c) < 128 for c in diskview.Explorer(scan, now=NOW).frame(width=80, uni=False))
+
+
+def test_a_job_scan_of_a_project_runs_from_your_own_work_root_not_from_inside_the_folder_it_scans(inproc, monkeypatch, tmp_path):
+    inproc([])
+
+    cli.CONFIG_PATH.write_text(cli.CONFIG_PATH.read_text() + '\n[projects.alpha]\ndir = "/somewhere/alpha"\n')
+    Cluster(monkeypatch, scan_file(tmp_path, root="/somewhere/alpha"))
+    cli.main(["disk", "--scan", "--job", "--project", "alpha"])
+    entry = cli.ledger_read()[-1]
+    assert entry["template"] == "disk_scan" and entry["project"] is None
+    assert not entry["remote_dir"].startswith("/somewhere/alpha") and entry["remote_dir"].startswith(str(tmp_path / "remote"))
+    _, rows = staged(tmp_path)
+    assert rows[0]["root"] == "/somewhere/alpha"                                             # it still scans the project's folder
+    assert (tmp_path / "state/disk/project-alpha.json").exists()
+
+
+# ---- the live view: the cached scan first, a status line while fresh data is collected, then the swap ----
+
+import io
+import threading
+
+SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def test_a_status_line_shows_a_spinner_while_collecting_and_a_tick_or_cross_after():
+    ex = diskview.Explorer(SCAN, now=NOW)
+    assert lines_of(ex)[2].strip() == "me"                                                       # no status, no extra line
+    ex.set_status("collecting folder sizes · 3 measured · 12 s", "busy")
+    ls = lines_of(ex)
+    assert ls[2].strip()[0] in SPIN and "collecting folder sizes · 3 measured · 12 s" in ls[2] and ls[3].strip() == "me"
+    ex.tick = 3
+    assert lines_of(ex)[2].strip()[0] == SPIN[3]                                                 # the spinner turns with the tick
+    ex.set_status("updated just now", "done")
+    assert lines_of(ex)[2].strip().startswith("✓") and "updated just now" in lines_of(ex)[2]
+    ex.set_status("refresh failed: ssh: connect failed; showing the older data", "error")
+    assert lines_of(ex)[2].strip().startswith("✗")
+    ex.set_status(None)
+    assert lines_of(ex)[2].strip() == "me"
+    coloured = {k: diskview.Explorer(SCAN, now=NOW) for k in ("busy", "done", "error")}
+    for k, ex2 in coloured.items():
+        ex2.set_status("x", k)
+    assert "38;5;153" in coloured["busy"].frame(width=100, color=True).splitlines()[2]            # sky
+    assert "38;5;158" in coloured["done"].frame(width=100, color=True).splitlines()[2]            # mint
+    assert "38;5;211" in coloured["error"].frame(width=100, color=True).splitlines()[2]           # rose
+    busy = coloured["busy"]
+    assert all(ord(c) < 128 for c in busy.frame(width=80, uni=False)) and busy.frame(width=80, uni=False).splitlines()[2].strip()[0] in "|/-\\"
+    for width in (50, 72, 100):
+        assert all(len(shown(l)) <= width for l in busy.frame(width=width, color=True).splitlines())
+
+
+def test_the_footer_offers_r_to_refresh_only_when_a_refresh_is_possible():
+    ex = diskview.Explorer(SCAN, now=NOW)
+    assert "r refresh" not in lines_of(ex)[-1]
+    ex.can_refresh = True
+    assert "r refresh" in lines_of(ex)[-1]
+
+
+def test_a_new_scan_replaces_the_old_one_and_keeps_your_place():
+    newer_models = mk("models", dirs=[HUB, mk("extra", own=(1, 2 * G), age=1)], own=(14, 1 * G),
+                      top=[("tokenizer.bin", 600 * M, 12), ("config.json", 4 * K, 40)], age=1)
+    newer = {**SCAN, "tree": mk("me", dirs=[newer_models, mk("runs", own=(9000, 90 * G), age=0)], own=(4, 5 * G), age=0)}
+    ex = diskview.Explorer(SCAN, now=NOW)
+    ex.goto("models")
+    ex.key("down")
+    name = ex.entries()[ex.cursor]["name"]                                                        # a file, whose row moves when the new scan arrives
+    ex.set_scan(newer)
+    assert ex.path == ["models"] and ex.entries()[ex.cursor]["name"] == name
+    assert "extra/" in [e["name"] for e in ex.entries()]
+    gone = {**SCAN, "tree": mk("me", dirs=[mk("runs", own=(9000, 80 * G), age=0)], own=(1, 1 * G), age=0)}
+    ex.set_scan(gone)                                                                             # the folder you were in has vanished
+    assert ex.path == [] and ex.cursor < len(ex.entries())
+
+
+def test_with_no_scan_yet_the_explorer_waits_and_then_takes_the_first_one():
+    ex = diskview.Explorer(diskview.placeholder_scan("/projects/me"), now=NOW)
+    ex.set_status("connecting…", "busy")
+    text = "\n".join(lines_of(ex))
+    assert "/projects/me" in text and "waiting for the first scan" in text and "connecting…" in text
+    ex.set_scan(SCAN)
+    assert "models/" in "\n".join(lines_of(ex)) and "waiting for the first scan" not in "\n".join(lines_of(ex))
+
+
+def wait_for_text(read, needle, timeout=3.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if needle in read():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_the_refresher_runs_work_on_a_thread_and_hands_over_the_result_once():
+    gate = threading.Event()
+
+    def work(progress, track):
+        progress("collecting 1")
+        gate.wait(3)
+        progress("collecting 2")
+        return SCAN
+    r = diskview.Refresher(work)
+    assert r.take() is None and not r.running() and r.elapsed() == 0
+    r.start()
+    assert wait_for_text(lambda: r.status, "collecting 1") and r.running() and r.take() is None and r.elapsed() >= 0
+    gate.set()
+    r.join(3)
+    assert r.take() is SCAN and r.take() is None and not r.running() and r.error is None and r.done
+    r.restart()                                                                                    # r: measure again
+    r.join(3)
+    assert r.take() is SCAN
+
+
+def test_a_failing_refresh_keeps_its_first_error_line_and_gives_no_scan():
+    def work(progress, track):
+        raise RuntimeError("ssh: connect to host failed\nmore detail")
+    r = diskview.Refresher(work)
+    r.start()
+    r.join(3)
+    assert r.take() is None and r.error == "ssh: connect to host failed" and r.done and not r.running()
+
+
+def test_stopping_the_refresher_kills_the_processes_the_work_started():
+    killed = []
+
+    class Proc:
+        def kill(self):
+            killed.append(True)
+    gate = threading.Event()
+
+    def work(progress, track):
+        track(Proc())
+        gate.wait(3)
+        return SCAN
+    r = diskview.Refresher(work)
+    r.start()
+    assert wait_for_text(lambda: "x" if r._procs else "", "x")
+    r.stop()
+    assert killed == [True]
+    gate.set()
+    r.join(3)
+    assert r.take() is None                                                                         # a stopped refresh hands over nothing
+
+
+def test_the_loop_shows_the_old_data_with_a_busy_line_then_swaps_in_the_new_data():
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+    out_f = os.fdopen(os.dup(slave), "w", buffering=1)
+    in_f = os.fdopen(slave, "r")
+    newer = {**SCAN, "tree": mk("me", dirs=[mk("fresh", own=(1, 2 * 1024 * G), age=0)], own=(1, 1 * G), age=0)}
+    gate = threading.Event()
+
+    def work(progress, track):
+        progress("collecting folder sizes · 7 measured")
+        gate.wait(5)
+        return newer
+    ex = diskview.Explorer(SCAN, now=NOW)
+    ex.can_refresh = True
+    ref = diskview.Refresher(work)
+    t = threading.Thread(target=diskview.run_explorer, kwargs={"ex": ex, "color": False, "uni": True, "stdin": in_f, "stdout": out_f, "refresher": ref}, daemon=True)
+    t.start()
+    seen = []
+
+    def read():
+        while select.select([master], [], [], 0.02)[0]:
+            seen.append(os.read(master, 65536).decode(errors="replace"))
+        return "".join(seen)
+    assert wait_for_text(read, "models/") and wait_for_text(read, "collecting folder sizes · 7 measured")        # the cached data, at once, with the status
+    assert "fresh/" not in read()
+    gate.set()
+    assert wait_for_text(read, "fresh/") and wait_for_text(read, "updated just now")                           # then the new data, in place
+    os.write(master, b"q")
+    end = time.time() + 5
+    while t.is_alive() and time.time() < end:                 # the terminal is put back only once its output has been read
+        read()
+        t.join(0.05)
+    assert not t.is_alive() and "\x1b[?1049l" in read()
+    os.close(master)
+
+
+# ---- the command: refresh by default in a terminal ----
+
+class StreamNode:
+    """A fake login node with a streaming transport: each output line goes to on_line as it arrives."""
+
+    def __init__(self, monkeypatch, out=QUICK, noise=""):
+        self.calls = []
+        self.out, self.noise = out, noise
+
+        def stream(me, cmd, input=None, on_line=None, on_start=None):
+            self.calls.append((cmd, input))
+            for line in (self.noise + self.out).splitlines():
+                if on_line:
+                    on_line(line)
+            return self.noise + self.out
+        monkeypatch.setattr(cli.Remote, "stream", stream)
+
+
+def in_a_terminal(monkeypatch):
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    opened = {}
+
+    def fake_explorer(ex, color=True, uni=True, stdin=None, stdout=None, refresher=None):
+        opened.update(ex=ex, refresher=refresher, scan_at_open=ex.scan, color=color, uni=uni)
+    monkeypatch.setattr(cli.diskview, "run_explorer", fake_explorer)
+    return opened
+
+
+def test_in_a_terminal_the_cached_scan_opens_at_once_and_a_refresh_collects_new_data(inproc, monkeypatch, tmp_path):
+    inproc([])
+    cache = tmp_path / "state/disk"
+    cache.mkdir(parents=True)
+    root = str(tmp_path / "remote")
+    (cache / "user.json").write_text(json.dumps({**SCAN, "root": root}))
+    node = StreamNode(monkeypatch)
+    opened = in_a_terminal(monkeypatch)
+    cli.main(["disk"])
+    assert opened["scan_at_open"]["tree"]["bytes"] == ETREE["bytes"] and opened["ex"].can_refresh is True      # the cached data is what opens
+    assert node.calls == []                                                                                      # nothing collected before the screen is up
+    ref = opened["refresher"]
+    ref.start()
+    ref.join(5)
+    fresh = ref.take()
+    assert fresh["mode"] == "quick" and fresh["tree"]["bytes"] == 5000 and node.calls[0][0] == "bash -s"
+    assert json.loads((cache / "user.json").read_text())["mode"] == "quick"                                    # and the cache is updated for next time
+    assert "collecting folder sizes" in ref.status or ref.done
+
+
+def test_with_no_cache_the_explorer_opens_on_a_placeholder_and_the_first_scan_fills_it(inproc, monkeypatch, tmp_path):
+    inproc([])
+    StreamNode(monkeypatch)
+    opened = in_a_terminal(monkeypatch)
+    cli.main(["disk"])
+    assert opened["scan_at_open"].get("placeholder") is True and opened["scan_at_open"]["root"] == str(tmp_path / "remote")
+    ref = opened["refresher"]
+    ref.start()
+    ref.join(5)
+    opened["ex"].set_scan(ref.take())
+    assert opened["ex"].scan["tree"]["bytes"] == 5000 and (tmp_path / "state/disk/user.json").exists()
+
+
+def test_no_refresh_opens_the_cache_without_touching_the_cluster(inproc, monkeypatch, tmp_path):
+    inproc([])
+    cache = tmp_path / "state/disk"
+    cache.mkdir(parents=True)
+    (cache / "user.json").write_text(json.dumps({**SCAN, "root": str(tmp_path / "remote")}))
+    node = StreamNode(monkeypatch)
+    opened = in_a_terminal(monkeypatch)
+    cli.main(["disk", "--no-refresh"])
+    assert opened["refresher"] is None and opened["ex"].can_refresh is False and node.calls == []
+
+
+def test_no_refresh_contradicts_asking_for_a_scan_and_a_saved_file_is_never_refreshed(inproc, monkeypatch, tmp_path, capsys):
+    inproc([])
+    StreamNode(monkeypatch)
+    opened = in_a_terminal(monkeypatch)
+    with pytest.raises(SystemExit):
+        cli.main(["disk", "--no-refresh", "--scan"])
+    assert "contradict" in capsys.readouterr().err
+    cli.main(["disk", "--from", str(scan_file(tmp_path))])
+    assert opened["refresher"] is None
+
+
+def test_a_job_refresh_reports_queued_running_and_fetching_then_updates_the_cache(inproc, monkeypatch, tmp_path):
+    inproc([])
+    root = str(tmp_path / "remote")
+    cluster = Cluster(monkeypatch, scan_file(tmp_path, root=root), states=("PENDING", "RUNNING", "COMPLETED"))
+    opened = in_a_terminal(monkeypatch)
+    texts = []
+    real = diskview.Refresher._progress
+    monkeypatch.setattr(diskview.Refresher, "_progress", lambda self, t: (texts.append(t), real(self, t))[1])
+    cli.main(["disk", "--job"])
+    ref = opened["refresher"]
+    ref.start()
+    ref.join(10)
+    assert ref.take()["root"] == root and ref.error is None
+    joined = " | ".join(texts)
+    assert joined.index("submitting") < joined.index("queued") < joined.index("running") < joined.index("fetching")
+    assert (tmp_path / "state/disk/user.json").exists() and cli.ledger_read()[-1]["template"] == "disk_scan"
+
+
+def test_the_streaming_transport_hands_over_lines_as_they_come_and_the_process_for_stopping(monkeypatch):
+    class Proc:
+        def __init__(self, *a, **k):
+            self.stdin, self.stdout, self.stderr = io.StringIO(), iter(["S\tx\n", "5\t1\t./a\n"]), io.StringIO("")
+            self.returncode = 0
+            Proc.last = self
+
+        def wait(self):
+            return self.returncode
+    monkeypatch.setattr(cli.subprocess, "Popen", Proc)
+    got, started = [], []
+    out = cli.Remote({"ssh_host": "h"}, False).stream("bash -s", input="echo hi", on_line=got.append, on_start=started.append)
+    assert got == ["S\tx", "5\t1\t./a"] and out == "S\tx\n5\t1\t./a\n" and started == [Proc.last]
+    Proc.last.stdin.seek(0) if False else None
+    bad = type("Bad", (Proc,), {"__init__": lambda self, *a, **k: (Proc.__init__(self), setattr(self, "stderr", io.StringIO("Permission denied")), setattr(self, "returncode", 255))[0]})
+    monkeypatch.setattr(cli.subprocess, "Popen", bad)
+    with pytest.raises(cli.NuhpcError, match="Permission denied"):
+        cli.Remote({"ssh_host": "h"}, False).stream("bash -s", input="x")

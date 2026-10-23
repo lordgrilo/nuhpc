@@ -12,12 +12,78 @@ import os
 import select
 import shutil
 import sys
+import threading
 import time
 
 STYLE = {"pink": "38;5;217", "lavender": "38;5;183", "sky": "38;5;153", "mint": "38;5;158", "peach": "38;5;223",
          "lemon": "38;5;229", "rose": "38;5;211", "bold": "1", "dim": "2"}
 PALETTE = ("pink", "lavender", "sky", "mint", "peach", "lemon")
 DAY = 86400
+SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def placeholder_scan(root: str) -> dict:
+    """An empty scan to open on when there is none yet; the first real one replaces it."""
+    return {"version": 1, "mode": "quick", "placeholder": True, "root": root, "depth": 4, "names": False, "scanned_at": None,
+            "partial": False, "unscanned": 0, "unreadable": 0, "largest": [],
+            "tree": {"name": root.rstrip("/").rpartition("/")[2] or root, "bytes": 0, "files": None, "newest": None,
+                     "own": {"files": None, "bytes": 0}}}
+
+
+class Refresher:
+    """Collects a fresh scan on a thread while the explorer is on screen. `work(progress, track)` returns the new scan: it reports what
+    it is doing with progress(text), and hands any subprocess it starts to track(proc) so that quitting can kill it."""
+
+    def __init__(self, work):
+        self.work = work
+        self.status, self.error, self.done = "connecting…", None, False
+        self._scan, self._procs, self._thread, self._started, self._stopped = None, [], None, None, False
+
+    def start(self) -> None:
+        self.status, self.error, self.done, self._scan, self._stopped = "connecting…", None, False, None, False
+        self._procs = []
+        self._started = time.monotonic()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    restart = start
+
+    def _progress(self, text: str) -> None:
+        self.status = text
+
+    def _run(self) -> None:
+        try:
+            scan = self.work(self._progress, self._procs.append)
+            if not self._stopped:
+                self._scan = scan
+        except Exception as ex:                              # whatever went wrong is reported, never raised into the screen
+            if not self._stopped:
+                self.error = (str(ex).strip().splitlines() or [type(ex).__name__])[0]
+        finally:
+            self.done = True
+
+    def running(self) -> bool:
+        return self._started is not None and not self.done
+
+    def elapsed(self) -> float:
+        return 0 if self._started is None else time.monotonic() - self._started
+
+    def take(self):
+        """The new scan, once; None while there is nothing new."""
+        scan, self._scan = self._scan, None
+        return scan
+
+    def stop(self) -> None:
+        self._stopped = True
+        for p in list(self._procs):
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    def join(self, timeout=None) -> None:
+        if self._thread is not None:
+            self._thread.join(timeout)
 
 
 def fmt_size(n: float) -> str:
@@ -133,14 +199,46 @@ class Explorer:
 
     def __init__(self, scan: dict, now: float | None = None, sort: str = "size", view: str = "tree"):
         self.scan, self.sort, self.view = scan, sort, view
-        self.now = time.time() if now is None else now
-        self.ref = scan.get("scanned_at") or self.now         # ages count from when the scan ran
+        self._now = now                                       # None: the real clock, so "scanned 3 min ago" keeps counting
+        self.ref = scan.get("scanned_at") or self.now
+        self.status = None                                    # (text, "busy" | "done" | "error"): a line under the title
+        self.tick = 0                                         # turns the spinner
+        self.can_refresh = False         # ages count from when the scan ran
         self.path: list = []                                  # folder names from the root down to the current folder
         self.cursor = self.scroll = 0
         self.message = ""
         self._back: list = []                                 # (cursor, scroll) of each folder above the current one
         self._other = (0, 0)                                  # the cursor and scroll of the view that isn't showing
         self._page = 10
+
+    @property
+    def now(self) -> float:
+        return time.time() if self._now is None else self._now
+
+    def set_status(self, text, kind: str = "busy") -> None:
+        self.status = (text, kind) if text else None
+
+    def set_scan(self, scan: dict) -> None:
+        """Swap in a newer scan, keeping the folder you are in (or the nearest one above it that still exists) and the selected entry."""
+        keep = None
+        if self.view == "tree":
+            es = self.entries()
+            keep = es[self.cursor]["name"] if es and self.cursor < len(es) else None
+        self.scan = scan
+        self.ref = scan.get("scanned_at") or self.now
+        node, path = scan["tree"], []
+        for name in self.path:
+            child = next((d for d in node.get("dirs", []) if d["name"] == name), None)
+            if child is None:
+                break
+            path.append(name)
+            node = child
+        self.path, self._back = path, self._back[:len(path)]
+        if self.view == "largest" and not scan.get("largest"):
+            self.view = "tree"
+        if self.view == "tree":
+            names = [e["name"] for e in self.entries()]
+            self.cursor = names.index(keep) if keep in names else max(0, min(self.cursor, len(names) - 1))
 
     # ---- what is shown
     def node(self) -> dict:
@@ -278,12 +376,18 @@ class Explorer:
         t = s["tree"]
         size = ("≥ " if uni else ">= ") * bool(t.get("incomplete")) + fmt_size(t["bytes"])
         what = size if t.get("files") is None else f"{size} in {t['files']:,} files"
-        facts = f"scanned {fmt_ago(self.now - s['scanned_at'])} {sep} {what}" if s.get("scanned_at") else what
+        facts = ("no scan yet" if s.get("placeholder") else f"scanned {fmt_ago(self.now - s['scanned_at'])} {sep} {what}" if s.get("scanned_at") else what)
         head = [P.row(" ", ("nuhpc disk", "pink", "bold"), f" {sep} ", (s["root"], "lavender")),
                 P.row(" ", (facts, "dim"),
                       *([(f" {sep} quick scan", "dim")] if s.get("mode") == "quick" else []),
                       *([(f" {sep} partial ({s.get('unscanned', 0)} folder{'s' if s.get('unscanned', 0) != 1 else ''} not fully read)", "peach")] if s.get("partial") else []),
                       *([(f" {sep} {s['unreadable']} unreadable", "rose")] if s.get("unreadable") else []))]
+        if self.status:
+            text, kind = self.status
+            glyph = ((SPIN if uni else "|/-\\")[self.tick % (len(SPIN) if uni else 4)] if kind == "busy"
+                     else ("✓" if uni else "+") if kind == "done" else ("✗" if uni else "x"))
+            style = {"busy": "sky", "done": "mint", "error": "rose"}.get(kind, "dim")
+            head.append(P.row(" ", (glyph, style, "bold"), " ", (text, style)))
         fs = s.get("fs")
         if fs and fs.get("total"):                              # how full the whole disk is, and this folder's share of it
             frac = fs["used"] / fs["total"]
@@ -318,7 +422,7 @@ class Explorer:
         window = items[self.scroll:] if room is None else items[self.scroll:self.scroll + room]
         body = self._largest_rows(P, window, width, uni) if self.view == "largest" else self._tree_rows(P, window, width, uni)
         if not items:
-            body = [P.row("  ", ("(empty)", "dim"))]
+            body = [P.row("  ", ("waiting for the first scan…" if s.get("placeholder") else "(empty)", "dim"))]
 
         note = self.message
         n = self.node()
@@ -328,11 +432,13 @@ class Explorer:
             note = "this folder was not read: the scan ran out of time before reaching it"
         lines = head + body + [P.row(" ", (note, "peach")) if note else ""]
         if footer:
-            keys = (f"↑↓ move {sep} ⏎ open {sep} ⌫ back {sep} s sort: {self.sort} {sep} l largest {sep} q quit" if uni else
-                    f"up/down move {sep} Enter open {sep} Bksp back {sep} s sort: {self.sort} {sep} l largest {sep} q quit") \
-                if self.view == "tree" else \
-                (f"↑↓ move {sep} ⏎ show its folder {sep} l or ⌫ back {sep} q quit" if uni else
-                 f"up/down move {sep} Enter show its folder {sep} l or Bksp back {sep} q quit")
+            if self.view == "tree":
+                words = ["↑↓ move", "⏎ open", "⌫ back", f"s sort: {self.sort}", "l largest"] if uni else \
+                    ["up/down move", "Enter open", "Bksp back", f"s sort: {self.sort}", "l largest"]
+                words += (["r refresh"] if self.can_refresh else []) + ["q quit"]
+            else:
+                words = ["↑↓ move", "⏎ show its folder", "l or ⌫ back", "q quit"] if uni else ["up/down move", "Enter show its folder", "l or Bksp back", "q quit"]
+            keys = f" {sep} ".join(words)
             pos = f"{min(self.cursor + 1, len(items))}/{len(items)}"
             gap = max(1, width - 1 - len(keys) - len(pos))
             lines.append(P.row(" ", (keys, "dim"), " " * gap, (pos, "dim")))
@@ -394,37 +500,66 @@ class Explorer:
         return out
 
 
-def run_explorer(ex: Explorer, color: bool = True, uni: bool = True, stdin=None, stdout=None) -> None:
-    """Run the explorer full screen until the user quits. The terminal is always put back as it was."""
+def run_explorer(ex: Explorer, color: bool = True, uni: bool = True, stdin=None, stdout=None, refresher: Refresher | None = None) -> None:
+    """Run the explorer full screen until the user quits. The terminal is always put back as it was. With a refresher, the data on screen
+    is shown at once and a status line says what is being collected; the new scan is swapped in when it arrives, and `r` collects again."""
     import termios
     import tty
     stdin, stdout = stdin or sys.stdin, stdout or sys.stdout
     fd = stdin.fileno()
     saved = termios.tcgetattr(fd)
-    last, dirty = None, True
+    last, dirty, done_at = None, True, None
+    if refresher is not None:
+        ex.can_refresh = True
+        if not refresher.running():
+            refresher.start()
+        ex.set_status("connecting…", "busy")
     try:
         tty.setcbreak(fd)                                    # no echo, no line buffering; Ctrl-C still interrupts
         stdout.write("\033[?1049h\033[?25l")                 # the alternate screen, and no cursor
         stdout.flush()
         while True:
+            if refresher is not None:
+                fresh = refresher.take()
+                if fresh is not None:
+                    ex.set_scan(fresh)
+                    ex.set_status("updated just now", "done")
+                    done_at, dirty = time.monotonic(), True
+                elif refresher.running():
+                    ex.set_status(f"{refresher.status} · {refresher.elapsed():.0f} s", "busy")
+                    ex.tick, dirty = ex.tick + 1, True
+                elif refresher.error and not (ex.status and ex.status[1] == "error"):
+                    ex.set_status(f"refresh failed: {refresher.error}; showing the older data", "error")
+                    dirty = True
+                elif done_at is not None and ex.status and ex.status[1] == "done" and time.monotonic() - done_at > 8:
+                    ex.set_status(None)
+                    dirty = True
             size = shutil.get_terminal_size((80, 24))
             if dirty or size != last:
                 frame = ex.frame(width=min(size.columns, 120), height=size.lines, color=color, uni=uni)
                 stdout.write("\033[H" + "\033[K\n".join(frame.splitlines()) + "\033[K\033[J")
                 stdout.flush()
                 last, dirty = size, False
-            if not select.select([fd], [], [], 0.4)[0]:     # a quiet moment: loop to notice a resized window
+            busy = refresher is not None and refresher.running()
+            if not select.select([fd], [], [], 0.25 if busy else 0.4)[0]:    # a quiet moment: loop to turn the spinner or notice a resize
                 continue
             data = os.read(fd, 64)
             if not data:
                 return
             for k in parse_keys(data):
                 dirty = True
+                if k == "r" and refresher is not None:
+                    if not refresher.running():
+                        refresher.start()
+                        ex.set_status("connecting…", "busy")
+                    continue
                 if not ex.key(k):
                     return
     except KeyboardInterrupt:
         pass
     finally:
+        if refresher is not None:
+            refresher.stop()
         stdout.write("\033[?25h\033[?1049l")
         stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)

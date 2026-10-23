@@ -10,7 +10,9 @@ Design rules:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
+import io
 import itertools
 import json
 import math
@@ -24,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import tomllib
 from datetime import datetime, timedelta
@@ -141,6 +144,40 @@ class Remote:
     def run(self, cmd: str, retry=True, input: str | None = None) -> str:
         # Login shell so `module`, `sbatch`, etc. are on PATH. `input` is fed to the command's stdin (a script for `python3 -`).
         return self._exec(["ssh", "-o", "BatchMode=yes", self.host, "bash -lc " + shlex.quote(cmd)], retry=retry, input=input)
+
+    def stream(self, cmd: str, input: str | None = None, on_line=None, on_start=None) -> str:
+        """Like run(), but hands each output line to `on_line` as it arrives, and the process to `on_start` so that a caller can stop it.
+        Never retried: a capped, long-running command is not silently repeated."""
+        argv = ["ssh", "-o", "BatchMode=yes", self.host, "bash -lc " + shlex.quote(cmd)]
+        if self.dry:
+            print("[dry-run] " + " ".join(shlex.quote(a) for a in argv), file=sys.stderr)
+            return ""
+        try:
+            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except FileNotFoundError:
+            raise NuhpcError("'ssh' not found on this machine (install it)")
+        if on_start:
+            on_start(proc)
+        err: list[str] = []
+        reader = threading.Thread(target=lambda: err.append(proc.stderr.read()), daemon=True)   # drained so a chatty remote cannot block
+        reader.start()
+        try:
+            proc.stdin.write(input or "")
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        lines = []
+        for line in proc.stdout:
+            lines.append(line)
+            if on_line:
+                on_line(line.rstrip("\n"))
+        code = proc.wait()
+        reader.join(2)
+        if code != 0:
+            text = "".join(err).strip()
+            hint = "\n(hint: run `nuhpc connect` to open an authenticated SSH session first)" if "Permission denied" in text else ""
+            raise NuhpcError(f"command failed ({code}): {' '.join(argv[:3])} ...\n{text}{hint}")
+        return "".join(lines)
 
     def rsync(self, src: str, dst: str, extra: list[str] | None = None) -> None:
         argv = ["rsync", "-az", "--partial", "-e", "ssh -o BatchMode=yes", *(extra or []), src, dst]
@@ -1294,7 +1331,18 @@ def cmd_submit(args, cfg, R, quiet=False, tasks=None):
         if (code / ".nuhpcignore").exists():
             ex.append(f"--exclude-from={code / '.nuhpcignore'}")
         R.rsync(f"{code}/", f"{host}:{run_dir}/code/", ex)
-    out = R.run(f"cd {shlex.quote(run_dir)} && sbatch --parsable job.sbatch", retry=False)
+    try:
+        out = R.run(f"cd {shlex.quote(run_dir)} && sbatch --parsable job.sbatch", retry=False)
+    except NuhpcError as first:
+        # Slurm sometimes accepts a job and still reports an error ("Unexpected message received"). Look for a job already queued from
+        # this run's folder before the caller retries: a repeat would queue it twice.
+        try:
+            out = R.run(f"squeue --me -h -o '%i|%Z' | grep -F -- {shlex.quote('|' + run_dir)} | head -1 | cut -d'|' -f1")
+        except NuhpcError:
+            raise first
+        if not out.strip():
+            raise first
+        print(f"[nuhpc] warning: sbatch reported an error, but job {out.strip()} exists for this run; using it", file=sys.stderr)
     job_id = out.strip().split(";")[0] if out.strip() else "DRY-RUN"
     result = {**meta, "per_row_resources": res if rpj else None, "waves": waves, "warnings": warnings,
               "job_id": job_id, "remote_dir": run_dir, "local_stage": str(stage)}
@@ -1664,6 +1712,19 @@ def load_scan(path) -> dict:
         raise NuhpcError(f"cannot read {path}: {ex}")
 
 
+def finish_quick(out: str, scope: dict, cfg: dict, started: float) -> dict:
+    """Assemble the quick scan from the remote script's records and cache it. An empty reply is an error, not an empty picture."""
+    if not any(line[:2] in ("D\t", "F\t") or line[:1].isdigit() for line in out.splitlines()):
+        raise NuhpcError(f"nothing came back for {scope['root']}: does it exist, and can you read it?")
+    scan = diskquick.tree_from_quick(out, scope["root"], scope["depth"], elapsed=time.monotonic() - started, host=cfg["ssh_host"])
+    cache = STATE_DIR / "disk"
+    cache.mkdir(parents=True, exist_ok=True)
+    tmp = cache / ".incoming.json"
+    tmp.write_text(json.dumps(scan, separators=(",", ":")))
+    os.replace(tmp, cache / f"{scope_key(cfg, scan['root'])}.json")
+    return scan
+
+
 def scan_here(args, cfg: dict, R):
     """The quick scan: folder sizes from `du` on the login node, no job. A capped, lowest-priority script goes over ssh on stdin
     (nothing is written there), six `du` run at a time, and what finished inside the cap is assembled here; the rest is flagged."""
@@ -1677,19 +1738,30 @@ def scan_here(args, cfg: dict, R):
           file=sys.stderr)
     t0 = time.monotonic()
     out = R.run("bash -s", retry=False, input=script)             # a capped run is never silently repeated
-    if not any(line[:2] in ("D\t", "F\t") or line[:1].isdigit() for line in out.splitlines()):
-        raise NuhpcError(f"nothing came back for {scope['root']}: does it exist, and can you read it?")
-    scan = diskquick.tree_from_quick(out, scope["root"], scope["depth"], elapsed=time.monotonic() - t0, host=cfg["ssh_host"])
-    cache = STATE_DIR / "disk"
-    cache.mkdir(parents=True, exist_ok=True)
-    tmp = cache / ".incoming.json"
-    tmp.write_text(json.dumps(scan, separators=(",", ":")))
-    os.replace(tmp, cache / f"{scope_key(cfg, scan['root'])}.json")
+    scan = finish_quick(out, scope, cfg, t0)
     if scan["partial"]:
         print(f"[nuhpc] partial: {scan['unscanned']} folders were not fully read before the {budget:g} s cap, so the sizes above them are "
               f"lower bounds (marked >=). Raise the cap with --budget SECONDS, or use --job for the whole thing, with file counts and the "
               f"largest files, on a compute node.", file=sys.stderr)
     return scan
+
+
+def quick_work(args, cfg: dict, R):
+    """The quick scan as work for the explorer's refresher: the same script, streamed, so the status line can say what is happening."""
+    scope = disk_scope(cfg, args)
+    budget = 60 if args.budget is None else args.budget
+    script = diskquick.quick_script(scope["root"], scope["depth"], budget)
+
+    def work(progress, track):
+        started, measured = time.monotonic(), [0]
+        progress("connecting…")
+
+        def on_line(line):
+            measured[0] += line[:1].isdigit()                     # du's own records: one per second-level folder finished
+            progress(f"collecting folder sizes · {measured[0]} measured" if measured[0] else "collecting folder sizes…")
+        out = R.stream("bash -s", input=script, on_line=on_line, on_start=track)
+        return finish_quick(out, scope, cfg, started)
+    return work
 
 
 def collect_scan(cfg: dict, R, e: dict) -> dict:
@@ -1712,20 +1784,24 @@ def collect_scan(cfg: dict, R, e: dict) -> dict:
     return scan
 
 
+def scan_job(args, cfg: dict, scope: dict, code: str):
+    """The submit arguments of a scan job. It always runs from your own work root, never from inside the folder it scans."""
+    cpu = cfg.get("profiles", {}).get("cpu", {})
+    budget = int(time_hours(scope["time"]) * 3600) - 180
+    return argparse.Namespace(
+        json=args.json, dry_run=args.dry_run, template="disk_scan", name="disk-scan", sweep=None, grid=None,
+        param=[f"root={scope['root']}", f"depth={scope['depth']}", f"names={'true' if scope['names'] else 'false'}", f"budget={budget}"],
+        code=code, max_parallel=None, confirm_big=False, pack=False, rows_per_job=None, parallel=None,
+        project=None, profile=None, partition=cpu.get("partition", "short"), time=scope["time"], cpus=4,
+        mem="8G", gres=None, nodes=1, account=None, constraint=None, gpus=None)
+
+
 def run_scan(args, cfg: dict, R):
     """Submit the scan job (the scanner travels with it), wait for it, and collect the result. None for a dry run."""
     scope = disk_scope(cfg, args)
-    cpu = cfg.get("profiles", {}).get("cpu", {})
     with tempfile.TemporaryDirectory(prefix="nuhpc-diskscan-") as code:
         shutil.copy(Path(__file__).with_name("diskscan.py"), Path(code) / "diskscan.py")
-        budget = int(time_hours(scope["time"]) * 3600) - 180
-        job = argparse.Namespace(
-            json=args.json, dry_run=args.dry_run, template="disk_scan", name="disk-scan", sweep=None, grid=None,
-            param=[f"root={scope['root']}", f"depth={scope['depth']}", f"names={'true' if scope['names'] else 'false'}",
-                   f"budget={budget}"],
-            code=code, max_parallel=None, confirm_big=False, pack=False, rows_per_job=None, parallel=None,
-            project=scope["project"], profile=None, partition=cpu.get("partition", "short"), time=scope["time"], cpus=4,
-            mem="8G", gres=None, nodes=1, account=None, constraint=None, gpus=None)
+        job = scan_job(args, cfg, scope, code)
         if args.dry_run:
             cmd_submit(job, cfg, R)
             return None
@@ -1745,9 +1821,64 @@ def run_scan(args, cfg: dict, R):
     return collect_scan(cfg, R, e)
 
 
+def job_work(args, cfg: dict, R):
+    """The job scan as work for the explorer's refresher: submit, watch the job (queued, running), fetch the result."""
+    scope = disk_scope(cfg, args)
+
+    def work(progress, track):
+        progress("submitting the scan job…")
+        with tempfile.TemporaryDirectory(prefix="nuhpc-diskscan-") as code:
+            shutil.copy(Path(__file__).with_name("diskscan.py"), Path(code) / "diskscan.py")
+            sub = cmd_submit(scan_job(args, cfg, scope, code), cfg, R, quiet=True)
+        e = find_run(sub["run_id"])
+        deadline = time.monotonic() + time_hours(scope["time"]) * 3600 + 600
+        while True:
+            rows, _ = run_states([e], R)
+            state = rows[0]["state"] if rows else "SUBMITTED"
+            if state == "COMPLETED":
+                break
+            if state in DONE:
+                raise NuhpcError(f"the scan job ended {state}: nuhpc logs {e['run_id']}")
+            progress(f"queued as job {e['job_id']}…" if state in ("SUBMITTED", "PENDING") else f"running on a compute node (job {e['job_id']})")
+            if time.monotonic() > deadline:
+                raise NuhpcError(f"the scan job is still {state.lower()}: nuhpc wait {e['run_id']}, then nuhpc disk --collect {e['run_id']}")
+            time.sleep(5)
+        progress("fetching the result…")
+        return collect_scan(cfg, R, e)
+    return work
+
+
+def disk_live(args, cfg: dict, R) -> None:
+    """The explorer opens at once on the cached scan (or on an empty one, the first time) while a refresher collects fresh data on a
+    thread; a status line says what it is doing, and the new scan is swapped in when it arrives."""
+    scope = disk_scope(cfg, args)
+    cached = STATE_DIR / "disk" / f"{scope_key(cfg, scope['root'])}.json"
+    scan = load_scan(cached) if cached.exists() else diskview.placeholder_scan(scope["root"])
+    ex = diskview.Explorer(scan)
+    if args.path:
+        try:
+            ex.goto(args.path)
+        except KeyError:
+            if not scan.get("placeholder"):
+                raise NuhpcError(f"'{args.path}' is not in this scan (it lists folders to depth {scan.get('depth')}; rescan deeper with --depth)")
+    ex.can_refresh = True
+    refresher = diskview.Refresher((job_work if args.job else quick_work)(args, cfg, R))
+    errors = io.StringIO()                                        # anything printed to stderr meanwhile would tear the screen
+    with contextlib.redirect_stderr(errors):
+        diskview.run_explorer(ex, color=use_color(True, os.environ), uni=unicode_ok(os.environ, getattr(sys.stdout, "encoding", None)),
+                              refresher=refresher)
+    if errors.getvalue():
+        sys.stderr.write(errors.getvalue())
+
+
 def cmd_disk(args, cfg, R):
     if (args.scan or args.job) and args.collect:
         raise NuhpcError("use either --scan (or --job) or --collect, not both")
+    if args.no_refresh and (args.scan or args.job):
+        raise NuhpcError("--no-refresh and --scan/--job contradict each other")
+    interactive = sys.stdout.isatty() and sys.stdin.isatty() and not args.print and not args.json
+    if interactive and not (args.from_file or args.collect or args.no_refresh or args.dry_run):
+        return disk_live(args, cfg, R)
     if args.from_file:
         scan = load_scan(Path(args.from_file).expanduser())
     elif args.collect:
@@ -1760,7 +1891,7 @@ def cmd_disk(args, cfg, R):
         scope = disk_scope(cfg, args)
         cached = STATE_DIR / "disk" / f"{scope_key(cfg, scope['root'])}.json"
         if not cached.exists():
-            raise NuhpcError(f"no scan of {scope['root']} yet: run `nuhpc disk --scan` (a short read-only job, a few minutes)")
+            raise NuhpcError(f"no scan of {scope['root']} yet: run `nuhpc disk --scan` (about a minute, no job)")
         scan = load_scan(cached)
     ex = diskview.Explorer(scan)
     if args.path:
@@ -1916,6 +2047,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lab", action="store_true", help="your group's folder: one total per member, no file names")
     p.add_argument("--depth", type=int, help="levels of folders the scan lists (default 4); deeper ones are only totalled")
     p.add_argument("--print", action="store_true", help="print the report once instead of opening the explorer")
+    p.add_argument("--no-refresh", action="store_true", help="in a terminal, open the cached scan without collecting fresh data "
+                                                          "(by default the explorer opens at once and refreshes in the background)")
     p.add_argument("--timeout", type=float, help="with --job: seconds to wait for the scan (default: its time limit plus 10 minutes)")
     p.add_argument("--interval", type=float, default=15, help="first poll interval in s while waiting; grows x1.5 up to 300")
     return ap
