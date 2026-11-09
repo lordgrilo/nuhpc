@@ -238,9 +238,43 @@ def test_transport_retries_repeatable_calls_only(monkeypatch):
         R.run("cd x && sbatch --parsable job.sbatch", retry=False)   # never resubmit
     assert len(seq) == 1
     seq.clear(); stderr[0] = "Permission denied (publickey)."
-    with pytest.raises(cli.NuhpcError, match="nuhpc connect"):
+    with pytest.raises(cli.NuhpcError, match="Research Computing"):
         R.run("sacct -j 1")                                          # auth failures are not transient
     assert len(seq) == 1
+
+
+@pytest.mark.parametrize("err, connect_helps", [
+    ("g@h: Permission denied (publickey).", False),                                    # RC's server: key only
+    ("g@h: Permission denied (publickey,gssapi-keyex,gssapi-with-mic).", False),       # nothing to type
+    ("g@h: Permission denied (publickey,keyboard-interactive).", True),                # Duo / one-time code
+    ("g@h: Permission denied (publickey,password).", True),
+    ("Host key verification failed.", True),
+    ("Permission denied", True),                                                       # no method list: as before
+])
+def test_auth_hint_sends_you_to_connect_only_when_something_can_be_typed(err, connect_helps):
+    hint = cli.auth_hint(err)
+    assert ("run `nuhpc connect`" in hint) is connect_helps
+    if not connect_helps:
+        assert "Research Computing" in hint and "IdentityFile" in hint
+
+
+def test_both_transports_give_the_same_key_hint(monkeypatch):
+    import io
+    err = "g@h: Permission denied (publickey)."
+
+    class Proc:
+        def __init__(self, *a, **k):
+            self.stdin, self.stdout, self.stderr, self.returncode = io.StringIO(), iter([]), io.StringIO(err), 255
+
+        def wait(self):
+            return self.returncode
+    monkeypatch.setattr(cli.subprocess, "Popen", Proc)
+    monkeypatch.setattr(cli.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 255, stdout="", stderr=err))
+    R = cli.Remote({"ssh_host": "h"}, dry=False)
+    for call in (lambda: R.run("true"), lambda: R.stream("true")):
+        with pytest.raises(cli.NuhpcError) as e:
+            call()
+        assert "IdentityFile" in str(e.value) and "run `nuhpc connect`" not in str(e.value)
 
 
 def test_missing_required_param_aborts_job(tmp_path, env):

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.2 (2026-11-09)
+
+- **The SSH failure hint no longer sends you to `nuhpc connect` when it cannot help.** `Permission denied` always said "run `nuhpc connect`", right when the server offered a password or Duo prompt but wrong for a server that offers only keys, which is Explorer since 2026-11-06. The hint now reads the methods ssh reports in `Permission denied (...)`: with `password` or `keyboard-interactive` among them it still says to run `nuhpc connect`; with only key methods it says the key was refused and points to the README's SSH section (download the key Research Computing issues, set `IdentityFile`). One helper, `auth_hint`, serves both transports. The skill's stop-and-tell-the-human rule now covers this hint too.
+
 ## 0.8.1 (2026-11-09)
 
 - **README: SSH setup follows Research Computing's new key policy.** Since 2026-11-06 Explorer accepts only the key pair RC issues (downloaded from Open OnDemand into `~/.ssh/`); passwords, your own keys and `ssh-copy-id` no longer work and fail with `Permission denied (publickey)`. The README's SSH section now says how to download the two files, set `600`/`644`, and point `IdentityFile` at the RC key, and the troubleshooting row for that error says the same. Documentation only: no code changed. The connection-failure hint in the CLI still says to run `nuhpc connect`, which does not help for this error.

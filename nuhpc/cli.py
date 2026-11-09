@@ -113,6 +113,18 @@ def remote_path(cfg: dict, rel: str = "", project: str | None = None) -> str:
 
 # --------------------------------------------------------------------------- transport
 
+def auth_hint(err: str) -> str:
+    """What to try after an ssh authentication failure. `nuhpc connect` helps only when the server offers a
+    login that a person can type (password, Duo); ssh lists the offered methods in "Permission denied (...)".
+    A server that offers only keys (Explorer since 2026-11-06) needs the right key, not a session."""
+    m = re.search(r"Permission denied \(([^)]*)\)", err)
+    if m and not {"password", "keyboard-interactive"} & set(m.group(1).split(",")):
+        return ("\n(hint: the server refused your SSH key and offers no other login, so `nuhpc connect` cannot help. "
+                "On Explorer only the key Research Computing issues is accepted (since 2026-11-06): download it "
+                "from Open OnDemand and set IdentityFile to it in ~/.ssh/config; see the README, SSH)")
+    return "\n(hint: run `nuhpc connect` to open an authenticated SSH session first)"
+
+
 class Remote:
     def __init__(self, cfg: dict, dry: bool):
         self.cfg, self.host, self.dry = cfg, cfg["ssh_host"], dry
@@ -138,7 +150,7 @@ class Remote:
                   f"{RETRY_DELAYS[attempt]}s", file=sys.stderr)
             time.sleep(RETRY_DELAYS[attempt])
         if auth:
-            err += "\n(hint: run `nuhpc connect` to open an authenticated SSH session first)"
+            err += auth_hint(err)
         raise NuhpcError(f"command failed ({p.returncode}): {' '.join(argv[:3])} ...\n{err}")
 
     def run(self, cmd: str, retry=True, input: str | None = None) -> str:
@@ -175,7 +187,7 @@ class Remote:
         reader.join(2)
         if code != 0:
             text = "".join(err).strip()
-            hint = "\n(hint: run `nuhpc connect` to open an authenticated SSH session first)" if "Permission denied" in text else ""
+            hint = auth_hint(text) if "Permission denied" in text else ""
             raise NuhpcError(f"command failed ({code}): {' '.join(argv[:3])} ...\n{text}{hint}")
         return "".join(lines)
 

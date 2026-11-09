@@ -77,4 +77,4 @@ Do not propose these, because they do not lower the bill: bundling jobs to save 
 - Weights must already be cached (`hf_download`). Gated models (Llama, Gemma) need an `HF_TOKEN`; ask the human.
 - The Python environment (whatever `env_setup` activates) is the human's to change. If imports fail because it is missing or lacks a package, stop and give the human the command (`nuhpc submit env_build --profile cpu`, adding `-p extra="..."` for packages); don't run `env_build` yourself.
 - Don't cancel runs you didn't submit in this session unless asked.
-- If SSH fails with a hint to run `nuhpc connect`, stop and tell the human. Connecting is interactive and is theirs to do.
+- If SSH fails with a hint to run `nuhpc connect`, or a hint that the server refused the SSH key, stop and tell the human. Both are theirs to do: connecting is interactive, and getting the key means signing in to Open OnDemand with Duo.
