@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.1 (2026-11-09)
+
+- **README: SSH setup follows Research Computing's new key policy.** Since 2026-11-06 Explorer accepts only the key pair RC issues (downloaded from Open OnDemand into `~/.ssh/`); passwords, your own keys and `ssh-copy-id` no longer work and fail with `Permission denied (publickey)`. The README's SSH section now says how to download the two files, set `600`/`644`, and point `IdentityFile` at the RC key, and the troubleshooting row for that error says the same. Documentation only: no code changed. The connection-failure hint in the CLI still says to run `nuhpc connect`, which does not help for this error.
+
 ## 0.8.0 (2026-10-23)
 
 - **`nuhpc disk` shows the whole lab by default.** It used to show only your own folder; now it opens on your group's folder (the parent of `user_dir`) with every member's folders and the shared ones, listed to depth 4 with folder names but no file names. `--mine` is your own folder as before, `--lab` is the default spelled out, and without a group folder above `user_dir` the default is your own folder.

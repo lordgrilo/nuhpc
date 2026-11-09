@@ -47,13 +47,25 @@ Then, in order:
 
 ### SSH (the part that matters for unattended use)
 
-Install your key on the cluster once with `ssh-copy-id YOUR_NU_USERNAME@login.explorer.northeastern.edu`, which RC documents. Key logins need no Duo prompt, so `nuhpc` and agents can run unattended. For speed, or if your logins do ask for Duo, also add this to `~/.ssh/config`:
+Since 2026-11-06, Explorer accepts only the SSH key that Research Computing (RC) issues to you. Passwords and keys you made yourself, including any installed earlier with `ssh-copy-id`, are refused with `Permission denied (publickey)`, and `ssh-copy-id` cannot help because it needs a working login. RC has put a key pair in your home folder on the cluster, `~/.ssh/YOUR_NU_USERNAME-<timestamp>` (private) and the same name ending in `.pub`; see RC's [SSH instructions for Explorer](https://rc.northeastern.edu/2026/10/23/ssh-instructions-for-explorer/). Copy both files to your computer once:
+
+1. Sign in to Open OnDemand at `https://ood.explorer.northeastern.edu` (Northeastern single sign-on and Duo; this login did not change).
+2. Open Files → Home Directory → `.ssh`, tick *Show dotfiles*, and download the two files named `YOUR_NU_USERNAME-<timestamp>` and `YOUR_NU_USERNAME-<timestamp>.pub`. Download each from its own row menu, so you get the files and not a zip.
+3. Move them into `~/.ssh/` and lock the private key down (it arrives world-readable, and ssh refuses a key like that):
+
+   ```bash
+   mv -n ~/Downloads/YOUR_NU_USERNAME-<timestamp>* ~/.ssh/
+   chmod 600 ~/.ssh/YOUR_NU_USERNAME-<timestamp>
+   chmod 644 ~/.ssh/YOUR_NU_USERNAME-<timestamp>.pub
+   ```
+
+Leave everything in `~/.ssh` on the cluster alone: RC manages `authorized_keys` now, and re-adding an old key does not help. Key logins did not ask for Duo when this was checked (2026-11-09), so `nuhpc` and agents can run unattended. Then add this to `~/.ssh/config`, with the `IdentityFile` set to your RC key; the `ControlMaster` lines make every call reuse one connection:
 
 ```
 Host explorer login.explorer.northeastern.edu
     HostName login.explorer.northeastern.edu
     User YOUR_NU_USERNAME
-    IdentityFile ~/.ssh/id_ed25519
+    IdentityFile ~/.ssh/YOUR_NU_USERNAME-<timestamp>
     ControlMaster auto
     ControlPath ~/.ssh/cm-%r@%h:%p
     ControlPersist 12h
@@ -484,11 +496,11 @@ Recipe, if you go ahead: install Node and Claude Code in `$HOME`, and write a `p
 
 ## Troubleshooting on Explorer
 
-Every row below happened while setting this up (2026-10-07/09).
+Every row below happened while setting this up (2026-10-07/09; the first row, 2026-11-09).
 
 | symptom | cause | fix |
 |---|---|---|
-| `Permission denied (publickey)` | your key isn't in the cluster's `authorized_keys` | `ssh-copy-id` once (see Quick start) |
+| `Permission denied (publickey)` | since 2026-11-06 only the key RC issues is accepted, not passwords, your own keys or `ssh-copy-id` | download your RC key pair from Open OnDemand and point `IdentityFile` at it (see SSH, above) |
 | `conda … Killed` on the login node | RC's watchdog kills heavy processes there | do installs inside a job |
 | torch says `cuda available: True`, then "NVIDIA driver … too old" | the wheel's CUDA is newer than the driver (570.86, CUDA ≤12.8) | CUDA 12.9 builds (see Python environment); trust the smoke test's `cuda kernel: ok` |
 | vLLM log says "Application startup complete", but the job reports "not healthy" | jobs inherit `http_proxy`, so requests to `127.0.0.1` went to the proxy | `vllm_eval` sets `no_proxy`; do the same for any server you start yourself |
