@@ -1,11 +1,11 @@
 # nuhpc
 
-A small CLI for running GPU work on Northeastern's **Explorer** cluster (the successor of Discovery), from your laptop or from an agent (Claude Code, Codex).
+A small CLI for working on Northeastern's **Explorer** cluster (the successor of Discovery), from your laptop or from an agent (Claude Code, Codex): run jobs, build environments, move data, and see what you use and where it goes.
 
-It covers quick one-off tests, larger batch jobs that run models directly, and high-throughput vLLM serving. It is pure Python standard library (3.11+), and it relies on `ssh` and `rsync` on the local machine. Underneath it is plain Slurm; see "On another Slurm cluster" for what is Explorer's.
+Jobs are Slurm runs, on GPUs or CPUs: quick one-off tests, batch jobs and sweeps that run models directly, many small CPU rows packed into a few jobs, high-throughput vLLM serving, and multi-GPU training. Each run is a snapshot you can inspect and fetch, and limits stop an agent from over-submitting. Around the jobs, nuhpc builds your Python environment and caches models, uploads and downloads data, reports compute used against requested, shows your queues, the cluster's load and your fair share, and explores where your disk space, and the lab's quota, goes. It is pure Python standard library (3.11+), and it relies on `ssh` and `rsync` on the local machine. Underneath it is plain Slurm; see "On another Slurm cluster" for what is Explorer's.
 
 ```
-laptop / agent ──nuhpc──► ssh+rsync ──► login.explorer.northeastern.edu ──sbatch──► GPU nodes
+laptop / agent ──nuhpc──► ssh+rsync ──► login.explorer.northeastern.edu ──sbatch──► compute nodes
                  ledger                    <work root>/runs/<run_id>/{job.sbatch, sweep.jsonl, code/, outputs/, logs/, usage/}
 ```
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.3 (2026-11-10)
+
+- **The description covers everything nuhpc does, not only GPU work.** The README opening, the package description, `nuhpc --help` and the skill's trigger text now say that nuhpc runs Slurm jobs on GPUs or CPUs (tests, batch jobs, sweeps, packed CPU rows, vLLM, training) and also builds environments and the model cache, moves data, reports compute used, queue standing and fair share, and shows where disk space and the lab quota go. The diagram's "GPU nodes" is now "compute nodes". The skill's trigger text therefore also matches questions about the queue, usage and disk, which its steps already covered. Documentation and text only: no behaviour changed.
+
 ## 0.8.2 (2026-11-09)
 
 - **The SSH failure hint no longer sends you to `nuhpc connect` when it cannot help.** `Permission denied` always said "run `nuhpc connect`", right when the server offered a password or Duo prompt but wrong for a server that offers only keys, which is Explorer since 2026-11-06. The hint now reads the methods ssh reports in `Permission denied (...)`: with `password` or `keyboard-interactive` among them it still says to run `nuhpc connect`; with only key methods it says the key was refused and points to the README's SSH section (download the key Research Computing issues, set `IdentityFile`). One helper, `auth_hint`, serves both transports. The skill's stop-and-tell-the-human rule now covers this hint too.

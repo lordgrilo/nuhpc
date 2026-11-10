@@ -1,6 +1,6 @@
 ---
 name: nuhpc
-description: Run, monitor and collect experiments on Northeastern's Explorer HPC cluster (Slurm, GPUs) via the `nuhpc` CLI. Use when a task needs GPU compute, LLM/VLM inference or evals at scale, logit or hidden-state readouts from open-weight models, parameter sweeps, or training that can't run locally.
+description: Run, monitor and collect experiments on Northeastern's Explorer HPC cluster (Slurm, GPUs and CPUs) via the `nuhpc` CLI, and check what they use and where the space goes. Use when a task needs GPU or cluster compute, LLM/VLM inference or evals at scale, logit or hidden-state readouts from open-weight models, parameter or many-row CPU sweeps, training that can't run locally, a cluster Python environment or model cache, data moved to or from the cluster, or a question about the queue, fair share, compute used, or disk space and quota.
 ---
 
 # Running jobs on Explorer with nuhpc

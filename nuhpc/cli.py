@@ -1,4 +1,4 @@
-"""nuhpc: an agent-friendly CLI for running Slurm jobs on Northeastern's Explorer cluster.
+"""nuhpc: an agent-friendly CLI for working on Northeastern's Explorer cluster: Slurm jobs, environments, data, usage and disk.
 
 Design rules:
   * Installs (envs/, hf_cache/) live under `user_dir`; work (runs/, data/) under a nuhpc/ folder in the project's
